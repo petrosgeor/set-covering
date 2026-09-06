@@ -73,7 +73,7 @@ class BatchedEmitterEnv:
         self,
         *,
         seed: int | None = None,
-        mask: Bool[Tensor, "B"] | None = None,  # noqa: F821 - jaxtyping dimension
+        mask: Bool[Tensor, "B"] | None = None,
     ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
         """Restart selected rows and return the full batch.
 
@@ -124,9 +124,9 @@ class BatchedEmitterEnv:
         self, action: dict[str, Tensor]
     ) -> tuple[
         dict[str, Tensor],
-        Float[Tensor, "B"],  # noqa: F821 - jaxtyping dimension
-        Bool[Tensor, "B"],  # noqa: F821
-        Bool[Tensor, "B"],  # noqa: F821
+        Float[Tensor, "B"],
+        Bool[Tensor, "B"],
+        Bool[Tensor, "B"],
         dict[str, Tensor],
     ]:
         """Apply simultaneous exchanges and reward the change in score.
@@ -181,9 +181,9 @@ class BatchedEmitterEnv:
     def _evaluate_observation(
         self, observation: dict[str, Tensor]
     ) -> tuple[
-        Float[Tensor, "B"],  # noqa: F821 - jaxtyping dimension
-        Float[Tensor, "B"],  # noqa: F821
-        Float[Tensor, "B"],  # noqa: F821
+        Float[Tensor, "B"],
+        Float[Tensor, "B"],
+        Float[Tensor, "B"],
     ]:
         received_signal = observation["received_signal"]
         objective = (observation["weights"] * received_signal).sum(dim=1)
@@ -193,7 +193,7 @@ class BatchedEmitterEnv:
 
     def _get_reward(
         self, observation: dict[str, Tensor], next_observation: dict[str, Tensor]
-    ) -> Float[Tensor, "B"]:  # noqa: F821 - jaxtyping dimension
+    ) -> Float[Tensor, "B"]:
         """Return the score difference, including on the final transition."""
         _, _, score = self._evaluate_observation(observation)
         _, _, next_score = self._evaluate_observation(next_observation)

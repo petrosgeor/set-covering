@@ -4,7 +4,9 @@ The proposed policy takes an active environment observation and constructs one
 complete action. It represents the points with a transformer, chooses whether
 to stop and how many pairs to exchange, then chooses the exchange's members.
 
-This architecture is a proposed PPO baseline and has not been implemented.
+The [encoder implementation](../code/transformer_encoder.md) produces the point
+and global representations described in sections 1-4. The complete PPO policy
+remains proposed: its decoder, action/value heads, and training are not implemented.
 Model widths, encoder depth, and attention-head count remain parameters.
 The [problem](problem.md) and [environment](environment.md) define what the
 policy is trying to solve and how its actions change the selection.
@@ -113,8 +115,8 @@ e_i=\phi_{\mathrm{in}}(v_i)\in\mathbb R^d,
 $$
 
 The same parameters are used for every point. There is no separate input
-network for point 1 or point 2. The projection's internal width and depth are
-unspecified by this design.
+network for point 1 or point 2. The input projection uses two affine layers,
+with widths $D+4\to d\to d$ and a GELU activation between them.
 
 ```text
 v_1 [D+4] --> shared projection --> e_1 [d]
@@ -187,7 +189,10 @@ later pointer distributions select points for an exchange.
 Each encoder layer combines multiple heads and includes residual connections,
 normalization, and a pointwise feed-forward network. The encoder depth
 $L_{\mathrm{enc}}$ and head count $h_{\mathrm{enc}}$ remain symbolic parameters.
-The complete encoder returns $H$, with representation width $d$.
+The implementation uses pre-normalization, GELU in the feed-forward network,
+and zero dropout. Each layer is initialized independently. A final layer
+normalization after the stack produces $H$, with representation width $d$.
+The per-head widths in this implementation satisfy $d_a=d_v=d/h_{\mathrm{enc}}$.
 
 Attention is full: each point can attend to every point, including itself.
 There is no causal mask or positional encoding based on arbitrary point index.
@@ -220,6 +225,9 @@ Mean point representation [d] ---+
 Remaining budget fraction h/T --+--> concatenate [d+2] --> psi --> g [d]
 Feasibility b ------------------+
 ```
+
+The global projection uses two affine layers, with widths $d+2\to d\to d$
+and a GELU activation between them.
 
 In our starting example, $b=0$ because receiver 4 is underserved. The fraction
 $h/T$ tells the policy how much opportunity remains to change that selection.
