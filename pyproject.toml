@@ -8,8 +8,10 @@ dependencies = [
     "cvxpy",
     "gymnasium",
     "highspy",
+    "jaxtyping",
     "matplotlib",
     "numpy",
+    "pyyaml",
     "torch",
 ]
 
