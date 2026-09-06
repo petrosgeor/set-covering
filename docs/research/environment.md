@@ -6,7 +6,7 @@ selected and unselected points. The final selection determines the outcome.
 
 The [problem formulation](problem.md) defines the instance and its feasible
 solutions. This document explains the episode process realized by the
-[environment implementation](../../env.py). Its [code reference](../code/environment.md)
+[environment implementation](../../envs/emitter.py). Its [code reference](../code/environment.md)
 contains the public interface and execution details.
 
 ## A fixed instance and a changing selection

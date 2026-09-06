@@ -5,10 +5,13 @@ received signal while ensuring every receiver meets a minimum threshold.
 Every point is a receiver, and selected points also contribute signal according
 to their distance from each receiver.
 
-The repository implements a PyTorch environment for emitter-exchange episodes,
-with configuration and environment tests. The transformer encoder and GRU pointer
-policy for PPO are a proposed architecture; the model and its training are not
-implemented yet.
+The repository implements a PyTorch environment for emitter-exchange episodes.
+The transformer encoder and GRU pointer policy for PPO are a proposed
+architecture; the model and its training are not implemented yet.
+
+The repository is organized by responsibility: `envs/` contains implemented
+environment code, `parameters/` contains YAML configuration, and `models/` is
+reserved for model implementations.
 
 ## Research documentation
 

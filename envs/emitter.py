@@ -1,8 +1,6 @@
 """Tensor-native episodes for fixed-budget emitter placement.
 
-Each batch row is independent. Dense receiver-by-emitter contributions cost
-O(B N²) storage; transitions recompute signal rather than accumulate drift.
-The caller supplies valid inputs and actions. See docs/code/environment.md.
+Each batch row is independent.
 """
 
 from collections.abc import Callable

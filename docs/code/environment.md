@@ -1,6 +1,6 @@
 # Batched environment API and usage
 
-[`BatchedEmitterEnv`](../../env.py) runs independent emitter-exchange episodes
+[`BatchedEmitterEnv`](../../envs/emitter.py) runs independent emitter-exchange episodes
 with PyTorch tensors. It implements the process described in the
 [research environment](../research/environment.md). This reference specifies
 its constructor, dictionaries, caller preconditions, and collection lifecycle.
@@ -260,8 +260,6 @@ transitions. There is no automatic restart inside `step`.
 
 The following reachable transition illustrates the score crossing from
 infeasible to feasible. Its values are an example, not configuration settings.
-The same labeled transition is checked by
-[`test_worked_transition_cycle_and_snapshots`](../../tests/test_env.py).
 
 Take four one-dimensional points at `0, 0.5, 1, 1.5`, unit weights, $K=2$,
 and the illustrative threshold $\tau=0.5$. Use the illustrative decay
@@ -298,7 +296,8 @@ infeasible-to-feasible transition.
 ## Configuration and executable example
 
 All configuration fields are required and have no implicit defaults. The
-checked-in example values are in [`env.yaml`](../../env.yaml).
+checked-in example values are in
+[`environment.yaml`](../../parameters/environment.yaml).
 
 | Configuration field | Symbol | Usage |
 | --- | --- | --- |
@@ -317,9 +316,9 @@ Run this example from the repository root:
 ```python
 import torch
 
-from env import BatchedEmitterEnv, load_config
+from envs.emitter import BatchedEmitterEnv, load_config
 
-config = load_config("env.yaml")
+config = load_config("parameters/environment.yaml")
 points = torch.tensor([[[0.0], [0.5], [1.0], [1.5]]])  # B=1, N=4, D=1
 weights = torch.ones(1, 4)
 environment = BatchedEmitterEnv(
