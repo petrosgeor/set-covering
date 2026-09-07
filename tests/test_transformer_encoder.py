@@ -26,13 +26,12 @@ def make_model(
     return TransformerEncoder(
         config=config,
         coordinate_dim=coordinate_dim,
-        threshold=0.7,
         max_steps=max_steps,
     ).to(device=device, dtype=dtype)
 
 
 def observation() -> dict[str, Tensor]:
-    """Return two concrete point sets with different feasibility values."""
+    """Return two concrete point sets with heterogeneous receiver demands."""
     return {
         "points": torch.tensor(
             [[[0.0, 0.1], [0.5, 0.6], [1.0, 1.1]], [[0.2, 0.3], [0.7, 0.8], [1.2, 1.3]]]
@@ -40,8 +39,8 @@ def observation() -> dict[str, Tensor]:
         "weights": torch.tensor([[1.0, 0.5, 1.5], [0.75, 1.25, 0.25]]),
         "selected": torch.tensor([[True, False, True], [False, True, False]]),
         "received_signal": torch.tensor([[0.8, 0.9, 1.0], [0.4, 0.75, 1.0]]),
+        "demands": torch.tensor([[0.6, 1.0, 1.2], [0.5, 0.8, 1.1]]),
         "steps_remaining": torch.tensor([4, 2], dtype=torch.int64),
-        "feasible": torch.tensor([True, False]),
         "contributions": torch.tensor(
             [
                 [[1.0, 0.1, 0.2], [0.1, 1.0, 0.3], [0.2, 0.3, 1.0]],
@@ -69,15 +68,15 @@ def test_config_loads_starter_and_small_values(tmp_path: Path) -> None:
 
 
 def test_features() -> None:
-    """Point features keep coordinates, scalars, and the threshold margin in order."""
+    """Point features keep coordinates, scalars, and the signed demand margin in order."""
     model = make_model()
     obs = {
         "points": torch.tensor([[[1.25, -2.0], [3.0, 4.0]]]),
         "weights": torch.tensor([[0.25, 0.75]]),
         "selected": torch.tensor([[True, False]]),
         "received_signal": torch.tensor([[0.8, 1.3]]),
+        "demands": torch.tensor([[1.2, 1.0]]),
         "steps_remaining": torch.tensor([4]),
-        "feasible": torch.tensor([False]),
     }
     seen: list[Tensor] = []
     hook = model.input_projection[0].register_forward_pre_hook(
@@ -87,13 +86,13 @@ def test_features() -> None:
     hook.remove()
 
     expected = torch.tensor(
-        [[[1.25, -2.0, 0.25, 1.0, 0.8, 0.1], [3.0, 4.0, 0.75, 0.0, 1.3, 0.6]]]
+        [[[1.25, -2.0, 0.25, 1.0, 0.8, -0.4], [3.0, 4.0, 0.75, 0.0, 1.3, 0.3]]]
     )
     torch.testing.assert_close(seen[0], expected)
 
 
-def test_global_features_include_mean_fraction_and_feasibility() -> None:
-    """Global features contain the point mean, remaining fraction, and feasibility."""
+def test_global_features_include_mean_and_fraction() -> None:
+    """Global features contain the point mean and remaining-step fraction."""
     model = make_model(coordinate_dim=2, dtype=torch.float64)
     obs = {
         key: value.to(dtype=torch.float64) if value.is_floating_point() else value
@@ -110,7 +109,6 @@ def test_global_features_include_mean_fraction_and_feasibility() -> None:
         (
             point_embeddings.mean(dim=1),
             obs["steps_remaining"].to(torch.float64).unsqueeze(-1) / 7,
-            obs["feasible"].to(torch.float64).unsqueeze(-1),
         ),
         dim=-1,
     )
@@ -127,8 +125,8 @@ def test_shapes_and_reuse(coordinate_dim: int) -> None:
             "weights": torch.ones(batch_size, num_points),
             "selected": torch.zeros(batch_size, num_points, dtype=torch.bool),
             "received_signal": torch.ones(batch_size, num_points),
+            "demands": torch.full((batch_size, num_points), 0.5),
             "steps_remaining": torch.zeros(batch_size, dtype=torch.int64),
-            "feasible": torch.ones(batch_size, dtype=torch.bool),
         }
         points, global_embedding = model(obs)
         assert points.shape == (batch_size, num_points, 8)
@@ -144,7 +142,7 @@ def test_reordering_points() -> None:
     }
     order = torch.tensor([2, 0, 1])
     reordered = dict(obs)
-    for key in ("points", "weights", "selected", "received_signal"):
+    for key in ("points", "weights", "selected", "received_signal", "demands"):
         reordered[key] = obs[key][:, order]
     reordered["contributions"] = obs["contributions"][:, order][:, :, order]
 
@@ -168,8 +166,8 @@ def test_batch_rows_are_independent_and_inputs_are_untouched() -> None:
     changed["weights"][1] *= 2
     changed["selected"][1] = ~changed["selected"][1]
     changed["received_signal"][1] += 0.4
+    changed["demands"][1] += 0.2
     changed["steps_remaining"][1] = 6
-    changed["feasible"][1] = ~changed["feasible"][1]
 
     with torch.no_grad():
         points, global_embedding = model(obs)
@@ -185,13 +183,9 @@ def test_layers_are_independent_and_seed_reproducible() -> None:
     config = EncoderConfig(8, 3, 2, 16)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(314159)
-        first = TransformerEncoder(
-            config=config, coordinate_dim=2, threshold=0.7, max_steps=7
-        )
+        first = TransformerEncoder(config=config, coordinate_dim=2, max_steps=7)
         torch.manual_seed(314159)
-        second = TransformerEncoder(
-            config=config, coordinate_dim=2, threshold=0.7, max_steps=7
-        )
+        second = TransformerEncoder(config=config, coordinate_dim=2, max_steps=7)
 
         assert all(
             torch.equal(left, right)
@@ -253,12 +247,18 @@ def test_environment_reset_observation() -> None:
         num_emitters=2,
         max_exchanges=1,
         max_steps=4,
-        threshold=0.7,
         seed=17,
         device="cpu",
     )
+    demands = torch.tensor(
+        [[0.5, 0.7, 1.1, 1.4], [0.6, 0.8, 1.0, 1.2]], dtype=torch.float32
+    )
     env = BatchedEmitterEnv(
-        points, torch.ones(2, 4), lambda distances: torch.exp(-distances), config
+        points,
+        torch.ones(2, 4),
+        lambda distances: torch.exp(-distances),
+        config,
+        demands=demands,
     )
     obs, info = env.reset(seed=23)
     encoded_points, global_embedding = make_model(1, max_steps=4)(obs)

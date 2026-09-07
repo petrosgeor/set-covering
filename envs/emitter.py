@@ -15,12 +15,11 @@ from torch import Tensor
 
 @dataclass(frozen=True)
 class EnvConfig:
-    """Shared episode budgets, threshold, local random seed, and device."""
+    """Shared episode budgets, local random seed, and device."""
 
     num_emitters: int
     max_exchanges: int
     max_steps: int
-    threshold: float
     seed: int
     device: str
 
@@ -29,7 +28,7 @@ def load_config(path: str | Path) -> EnvConfig:
     """Read a flat, explicit YAML configuration without executable loading.
 
     Args:
-        path: YAML file containing exactly the six EnvConfig fields.
+        path: YAML file containing exactly the five EnvConfig fields.
 
     Returns:
         Shared configuration, with no implicit field defaults.
@@ -49,6 +48,8 @@ class BatchedEmitterEnv:
         weights: Float[Tensor, "B N"],
         decay: Callable[[Float[Tensor, "B N N"]], Float[Tensor, "B N N"]],
         config: EnvConfig,
+        *,
+        demands: Float[Tensor, "B N"],
     ) -> None:
         """Own an instance and prepare contributions; reset starts an episode.
 
@@ -59,10 +60,12 @@ class BatchedEmitterEnv:
                 finite at zero. Return the same shape, dtype, and device as
                 its distances input.
             config: Shared budgets and destination CPU/CUDA device.
+            demands: Matching-dtype finite, nonnegative receiver demand caps.
         """
         self.config = config
         self._points = points.detach().to(config.device).clone()
         self._weights = weights.detach().to(config.device).clone()
+        self._demands = demands.detach().to(config.device).clone()
         self._device = self._points.device
         self._contributions = self._build_contributions(decay)
         self._generator = torch.Generator(device=self._device)
@@ -129,17 +132,17 @@ class BatchedEmitterEnv:
         Bool[Tensor, "B"],
         dict[str, Tensor],
     ]:
-        """Apply simultaneous exchanges and reward the change in score.
+        """Apply simultaneous exchanges and reward the change in objective.
 
         Args:
             action: Dictionary with signed ternary "exchanges" [B,N] and Boolean
                 "stop" [B], on the configured device. Exchanges add unselected
                 points and remove selected ones in equal counts up to the cap.
-                Stops require feasibility and zero edits. Finished rows freeze.
+                Stops on active rows carry zero edits. Finished rows freeze.
 
         Returns:
-            Observation, reward, terminated, truncated, and info. Both explicit
-            stops and the task horizon terminate a row; truncated is always false.
+            Observation, reward, terminated, truncated, and info. Explicit stops
+            and the task horizon terminate a row; truncated is always false.
         """
         observation = self._get_observation()
         exchanges, stop = action["exchanges"], action["stop"]
@@ -183,21 +186,23 @@ class BatchedEmitterEnv:
     ) -> tuple[
         Float[Tensor, "B"],
         Float[Tensor, "B"],
-        Float[Tensor, "B"],
     ]:
         received_signal = observation["received_signal"]
-        objective = (observation["weights"] * received_signal).sum(dim=1)
-        shortfall = (self.config.threshold - received_signal).clamp_min(0).sum(dim=1)
-        score = torch.where(observation["feasible"], objective, -shortfall)
-        return objective, shortfall, score
+        capped_signal = torch.minimum(received_signal, observation["demands"])
+        objective = (observation["weights"] * capped_signal).sum(dim=1)
+        weighted_unmet_demand = (
+            observation["weights"]
+            * (observation["demands"] - received_signal).clamp_min(0)
+        ).sum(dim=1)
+        return objective, weighted_unmet_demand
 
     def _get_reward(
         self, observation: dict[str, Tensor], next_observation: dict[str, Tensor]
     ) -> Float[Tensor, "B"]:
-        """Return the score difference, including on the final transition."""
-        _, _, score = self._evaluate_observation(observation)
-        _, _, next_score = self._evaluate_observation(next_observation)
-        return next_score - score
+        """Return the objective difference, including on the final transition."""
+        objective, _ = self._evaluate_observation(observation)
+        next_objective, _ = self._evaluate_observation(next_observation)
+        return next_objective - objective
 
     def _get_observation(self) -> dict[str, Tensor]:
         """Return dynamic snapshots and borrowed read-only instance tensors."""
@@ -207,18 +212,18 @@ class BatchedEmitterEnv:
         return {
             "points": self._points,
             "weights": self._weights,
+            "demands": self._demands,
             "contributions": self._contributions,
             "selected": self._selected.clone(),
             "received_signal": received_signal,
             "steps_remaining": self._steps_remaining.clone(),
-            "feasible": (received_signal >= self.config.threshold).all(dim=1),
         }
 
     def _get_info(self, observation: dict[str, Tensor]) -> dict[str, Tensor]:
-        objective, shortfall, _ = self._evaluate_observation(observation)
+        objective, weighted_unmet_demand = self._evaluate_observation(observation)
         return {
             "objective": objective,
-            "shortfall": shortfall,
+            "weighted_unmet_demand": weighted_unmet_demand,
             "stopped": self._stopped.clone(),
             "timed_out": self._timed_out.clone(),
         }

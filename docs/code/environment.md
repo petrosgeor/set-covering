@@ -1,57 +1,62 @@
 # Batched environment
 
 [`BatchedEmitterEnv`](../../envs/emitter.py) runs independent emitter-exchange
-episodes using PyTorch tensors. The [research description](../research/environment.md)
-defines the objective, valid actions, and reward equations.
+episodes.
 
-Construct it with `points`, `weights`, a nonincreasing distance-to-contribution `decay` callable,
-and `EnvConfig`. `load_config(path)` reads the six required fields from
-[`environment.yaml`](../../parameters/environment.yaml): `num_emitters` (selection
-size), `max_exchanges` (pair limit), `max_steps` (horizon), `threshold` (minimum
-signal), `seed` (local random generator), and `device`. There are no defaults.
+Construct `BatchedEmitterEnv(points, weights, decay, config, *, demands)`.
+`decay` is nonincreasing, and tensors share a float dtype.
+`load_config(path)` reads the five required fields from
+[`environment.yaml`](../../parameters/environment.yaml): `num_emitters`,
+`max_exchanges`, `max_steps`, `seed`, and `device`.
 
 ## Observation
 
-Here `B` counts episodes, `N` points, and `D` coordinates per point.
+`B` counts episodes, `N` points, and `D` coordinates.
 
 | Field | Shape | Type |
 | --- | --- | --- |
 | `points` | `[B,N,D]` | float32/float64 |
-| `weights`, `received_signal` | `[B,N]` | Matching float |
+| `weights`, `demands`, `received_signal` | `[B,N]` | Matching float |
 | `contributions` | `[B,N,N]` | Matching float |
 | `selected` | `[B,N]` | Boolean |
 | `steps_remaining` | `[B]` | int64 |
-| `feasible` | `[B]` | Boolean |
 
 Fixed instance tensors are borrowed, read-only; dynamic observations are
-snapshots. `decay` preserves its `[B,N,N]` input's shape, dtype, and device.
+snapshots. Construction detaches, moves, and clones instance tensors.
+`received_signal` is the raw product `Az`. `decay` preserves input shape, dtype,
+and device.
 
 ## Usage
-
-Run from the repository root:
 
 ```python
 import torch
 from envs.emitter import BatchedEmitterEnv, load_config
 
 config = load_config("parameters/environment.yaml")
-points = torch.tensor([[[0.0], [0.5], [1.0], [1.5]]])
+points = torch.tensor([[[0.0], [0.5], [1.0], [1.5]]], dtype=torch.float32)
+demands = torch.tensor([[1.0, 1.25, 0.75, 1.0]], dtype=points.dtype)
 env = BatchedEmitterEnv(
-    points, torch.ones(1, 4), lambda d: torch.exp(-d), config
+    points,
+    torch.ones(1, 4, dtype=points.dtype),
+    lambda d: (1 - d).clamp_min(0),
+    config,
+    demands=demands,
 )
-observation, info = env.reset()
+observation, info = env.reset(seed=0)
 ```
 
 `step({"exchanges": edits, "stop": stop})` returns
-`(observation, reward, terminated, truncated, info)`. Signed integer edits
-`[B,N]` remove (`-1`) and add (`+1`) equal numbers of emitters within the cap.
-Boolean stops `[B]` require feasibility and zero edits. Inputs are caller-validated.
+`(observation, reward, terminated, truncated, info)`. Signed integer exchanges
+`[B,N]` have equal `-1` and `+1` counts within the cap. Callers validate that
+`-1` marks selected and `+1` marks unselected points. Active stops `[B]` carry
+zero edits and end rows. Demand satisfaction does not terminate an episode.
+Demands are finite, nonnegative, fixed across resets; zero is valid.
 
-Every active step consumes one decision. Stops and horizon exhaustion terminate;
-`truncated` is always false. Finished rows freeze with zero reward. `info`
-contains `[B]` fields `objective`, `shortfall`, `stopped`, and `timed_out`.
+Each active step consumes one decision. Stops and horizon exhaustion terminate;
+`truncated` is false; finished rows freeze with zero reward. `info`
+contains `[B]` fields `objective`, `weighted_unmet_demand`, `stopped`, and
+`timed_out`. Reward is next objective minus current objective.
 
-Call a full `reset()` first. Record terminal observations before
-`reset(mask=terminated | truncated)`, which restarts only completed rows and
-returns the full batch.
-Use `reset(seed=...)` to reseed its local generator.
+Call full `reset()` before masked reset. Record terminal observations before
+`reset(mask=terminated | truncated)`, which restarts completed rows and returns
+the full batch. `reset(seed=...)` reseeds the generator.

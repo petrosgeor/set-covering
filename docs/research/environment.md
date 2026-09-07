@@ -4,15 +4,15 @@ An episode starts with a selection of $K$ emitters and gives the policy at most
 $T$ decisions to change it. Each continuing action exchanges equally many
 selected and unselected points. The final selection determines the outcome.
 
-The [problem formulation](problem.md) defines the instance and its feasible
-solutions. This document explains the episode process realized by the
+The [problem formulation](problem.md) defines the instance, capped utility, and
+unmet-demand diagnostic. This document explains the episode process realized by the
 [environment implementation](../../envs/emitter.py). Its [code reference](../code/environment.md)
 contains the public interface and execution details.
 
 ## A fixed instance and a changing selection
 
-The point positions, weights, decay function, contribution matrix $A$, budget
-$K$, and threshold $\tau$ stay fixed throughout an episode. At decision time $t$,
+The point positions, weights, demands, decay function, contribution matrix $A$,
+budget $K$, and horizon stay fixed throughout an episode. At decision time $t$,
 the selection is $z_t$ and its signal is $r_t=Az_t$.
 
 Two additional quantities describe the episode's progress: the remaining
@@ -23,9 +23,9 @@ $$
 s_t=(z_t,h_t,q_t).
 $$
 
-The fixed instance supplies the context for interpreting this state. Signal,
-objective, and feasibility are derived from the instance and $z_t$.
-The [policy](model.md) receives those quantities when the episode is active.
+The fixed instance supplies the context for interpreting this state. Signal is
+part of the observation, while capped utility and unmet demand are diagnostics
+reported with it. The [policy](model.md) receives the observation when active.
 
 The horizon $T>0$ is a parameter of the search process. Another parameter,
 $M\geq0$, limits the number of exchanged pairs in one decision. The emitter
@@ -42,14 +42,14 @@ z_0\sim\operatorname{Uniform}\left(
 \qquad h_0=T,\qquad q_0=\mathrm{active}.
 $$
 
-This distribution does not condition on feasibility. An episode may start with
-underserved receivers. When $K=0$ or $K=N$, there is only one possible selection.
-Restarting an episode samples a selection for the same fixed instance.
+This distribution does not condition on demand satisfaction. An episode may
+start with unmet demand. When $K=0$ or $K=N$, there is only one possible
+selection. Restarting an episode samples a selection for the same fixed instance.
 
 We follow the [four-point example](problem.md#signal-from-the-selected-emitters)
 from the problem document. Suppose initialization gives $z_0=(1,1,0,0)^\top$.
-Its signal is $(1.5,1.5,0.5,0)^\top$, so receiver 4 is below the example's
-threshold of $0.5$.
+Its signal is $(1.5,1.5,0.5,0)^\top$, with $F(z_0)=2.75$ and
+$U(z_0)=1.25$.
 
 ## One continuing action
 
@@ -100,8 +100,8 @@ Selection after:  [1, 0, 0, 1]
 Signal after:     [1, 0.5, 0.5, 1]
 ```
 
-The new selection meets every threshold. Other valid exchanges can reduce
-signal or make a feasible selection infeasible. Validity constrains which edits
+The new selection has $F(z_1)=3$ and $U(z_1)=1$. Other valid exchanges can
+reduce capped utility or increase unmet demand. Validity constrains which edits
 can be submitted; the policy must learn which are useful.
 
 ## Continuing without edits and stopping
@@ -111,59 +111,35 @@ unchanged and consumes one decision. If $M=0$, $K=0$, or $K=N$, it is the only
 possible continuing exchange.
 
 Stopping is a separate decision that ends the episode with the current
-selection. A valid stop requires that selection to be feasible and the exchange
-to be zero. Feasibility alone does not end an episode: the policy can continue
-to search for a better feasible selection.
+selection. A valid stop has zero exchanges. Demand satisfaction does not end an
+episode, and an active episode may stop or continue from any demand state.
 
 After the example's exchange, the policy could stop at $(1,0,0,1)^\top$ or
-continue searching. The [problem example](problem.md#fixed-emitter-scores-and-coverage-constraints)
-shows that $(0,1,1,0)^\top$ has a higher feasible objective. A learned stop
-decision does not certify optimality.
+continue searching. A learned stop decision does not certify optimality.
 
-## Score and reward
+## Utility and reward
 
-The environment assigns a score to every selection, including infeasible ones.
-The objective $f(z)$ is defined in the [problem document](problem.md#feasibility-and-objective).
-For an infeasible selection, measure its total threshold shortfall:
-
-$$
-\Delta(z)=\sum_{i=1}^N\max(0,\tau-r_i).
-$$
-
-This shortfall is unweighted. A receiver with zero objective weight still
-contributes when it is below threshold. Define the score
-
-$$
-F(z)=\begin{cases}
-f(z),&z\text{ is feasible},\\
--\Delta(z),&z\text{ is infeasible}.
-\end{cases}
-$$
-
-Every feasible score is nonnegative, while every infeasible score is negative.
-Within the infeasible region, reducing shortfall improves the score. Within
-the feasible region, increasing the weighted objective improves it.
-
-One complete action earns the score difference:
+The environment evaluates every selection with the capped utility $F(z)$ and
+reports weighted unmet demand $U(z)$ from the [problem document](problem.md#capped-utility-and-unmet-demand).
+It uses only the utility for reward. One complete action earns the utility
+difference:
 
 $$
 R_t=F(z_{t+1})-F(z_t).
 $$
 
-For our example, the initial shortfall is $0.5$, giving score $-0.5$.
-After exchanging point 2 for point 4, the selection is feasible with objective
-3. The reward is therefore $3-(-0.5)=3.5$.
+For the running example, removing point 2 and adding point 4 changes the
+utility from $2.75$ to $3$. The reward is therefore $3-2.75=0.25$.
 
 | Quantity | Before the exchange | After the exchange |
 | --- | --- | --- |
-| Feasible | No | Yes |
-| Objective $f$ | $3.5$ | $3$ |
-| Shortfall $\Delta$ | $0.5$ | $0$ |
-| Score $F$ | $-0.5$ | $3$ |
+| Capped utility $F$ | $2.75$ | $3$ |
+| Weighted unmet demand $U$ | $1.25$ | $1$ |
+| Reward | - | $0.25$ |
 
 Stops and continuing no-ops receive zero reward because they leave the
 selection unchanged. A worsening exchange receives negative reward. The same
-score-difference rule applies to the final decision.
+utility-difference rule applies to the final decision.
 
 ## Decision budget and completion
 
@@ -206,13 +182,13 @@ separate external cutoff. Once completed, the state remains fixed until
 initialization starts another episode. Further calls on a completed state
 produce zero reward and preserve the completion reason.
 
-A timeout may leave a feasible or infeasible selection. The episode keeps its
-final selection; it does not recover an earlier best selection. An infeasible
-final selection is a failed search outcome, not a proof of instance infeasibility.
+A timeout may leave unmet demand. The episode keeps its final selection; it does
+not recover an earlier best selection. The final utility records the search
+outcome and does not prove that the instance has no better selection.
 
 ## Return over an episode
 
-With undiscounted rewards, the intermediate scores cancel. If the episode ends
+With undiscounted rewards, the intermediate utility values cancel. If the episode ends
 after $t_{\mathrm{end}}\leq T$ decisions,
 
 $$
@@ -224,7 +200,7 @@ $$
 \end{aligned}
 $$
 
-For a fixed initial selection, maximizing this return maximizes the final score.
+For a fixed initial selection, maximizing this return maximizes the final utility.
 There is no extra computation-cost reward for stopping early. The proposed
 policy uses discount factor $\gamma=1$ to retain this relationship.
 
@@ -242,6 +218,6 @@ exchange and how its probability connects to this episode-level return.
 | $M,m$ | Maximum and chosen exchange counts | Integers, $0\leq m\leq\min(M,K,N-K)$ |
 | $\mathcal R_t,\mathcal C_t$ | Removal and addition sets | Each contains $m$ points |
 | $a_t$ | Complete signed exchange | $\{-1,0,1\}^N$ |
-| $\Delta(z),F(z)$ | Threshold shortfall and environment score | Scalars |
+| $F(z),U(z)$ | Capped utility and weighted unmet demand | Scalars |
 | $R_t$ | Reward for one complete action | $F(z_{t+1})-F(z_t)$ |
 | $t_{\mathrm{end}}$ | Number of decisions before completion | Integer in $[1,T]$ |

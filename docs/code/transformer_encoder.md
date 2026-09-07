@@ -3,8 +3,9 @@
 [`TransformerEncoder`](../../models/transformer_encoder.py) maps an
 [environment observation](environment.md) to point embeddings `H [B,N,d]`
 and a global embedding `g [B,d]`. Here `B` counts episodes, `N` points,
-and `d` is the embedding width. Decoder, action/value heads, and PPO training
-remain unimplemented; see the [research model](../research/model.md).
+and `d` is the embedding width. The policy heads and pointer decoder are
+separate implemented modules; complete policy assembly and PPO training remain
+unimplemented.
 
 ## Configuration and computation
 
@@ -15,14 +16,15 @@ All four fields are required, without defaults: `model_dim` (embedding width),
 (feed-forward hidden width).
 
 For coordinate width `D`, each point has `D+4` features, ordered as
-`[coordinates, weight, selected, received_signal, received_signal - threshold]`.
-The encoder ignores `contributions`.
+`[coordinates, weight, selected, received_signal, received_signal - demands]`.
+The encoder ignores `contributions`. The global input concatenates mean point
+embeddings with `steps_remaining/max_steps`, giving width `d+1`.
 
 ```text
 Features [B,N,D+4] -> Linear -> GELU -> Linear -> [B,N,d]
-                 -> pre-norm transformer layers -> LayerNorm -> H
-Mean(H, points), steps_remaining/max_steps, feasible
-                 -> concatenate [B,d+2] -> Linear -> GELU -> Linear -> g [B,d]
+                 -> pre-norm transformer layers -> LayerNorm -> H [B,N,d]
+Mean(H), steps_remaining/max_steps
+                 -> concatenate [B,d+1] -> Linear -> GELU -> Linear -> g [B,d]
 ```
 
 Both projections have hidden width `d`. Transformer layers use GELU, zero
@@ -40,7 +42,6 @@ from models.transformer_encoder import TransformerEncoder, load_config
 encoder = TransformerEncoder(
     config=load_config("parameters/transformer_gru.yaml"),
     coordinate_dim=observation["points"].shape[-1],
-    threshold=config.threshold,
     max_steps=config.max_steps,
 ).to(observation["points"])
 H, g = encoder(observation)

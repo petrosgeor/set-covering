@@ -1,12 +1,14 @@
 # A transformer and pointer policy for emitter exchanges
 
-The proposed policy takes an active environment observation and constructs one
-complete action. It represents the points with a transformer, chooses whether
-to stop and how many pairs to exchange, then chooses the exchange's members.
+The implemented encoder, policy heads, and pointer decoder provide the model
+components for one emitter exchange. A complete policy assembly would choose
+whether to stop, choose an exchange count, and construct one action.
 
 The [encoder implementation](../code/transformer_encoder.md) produces the point
-and global representations described in sections 1-4. The complete PPO policy
-remains proposed: its decoder, action/value heads, and training are not implemented.
+and global representations described in sections 1-4. The
+[policy heads](../../models/policy_heads.py) and
+[pointer decoder](../../models/pointer_decoder.py) are implemented separately.
+Complete composition, action adaptation, and PPO training remain proposed.
 Model widths, encoder depth, and attention-head count remain parameters.
 The [problem](problem.md) and [environment](environment.md) define what the
 policy is trying to solve and how its actions change the selection.
@@ -36,7 +38,7 @@ Point representations H [N,d] ---------------------+
           v                                        |
 Mean pooling [d]                                   |
           |                                        |
-Add remaining budget and feasibility               |
+Add remaining budget fraction                       |
           |                                        |
           v                                        |
 Global representation g [d]                        |
@@ -72,30 +74,32 @@ walkthrough begins with the numbers supplied to that row.
 ## 1. Describe each point
 
 At the current decision, point $i$ has coordinates $x_i$, receiver weight $w_i$,
-selection indicator $z_i$, and received signal $r_i$. Its feature vector is
+selection indicator $z_i$, received signal $r_i$, and demand $u_i$. The encoder
+uses $u_i$ only to form the signed margin in its feature vector:
 
 $$
-v_i=\left[x_{i,:},w_i,z_i,r_i,r_i-\tau\right]
+v_i=\left[x_{i,:},w_i,z_i,r_i,r_i-u_i\right]
 \in\mathbb R^{D+4}.
 $$
 
 Coordinates contribute $D$ numbers; the other four entries are scalars.
 The selection indicator is represented numerically as zero or one.
-The final entry is the threshold margin: a negative value identifies an
-underserved receiver. It is determined by $r_i$ and the known threshold.
+The final entry is the signed demand margin. A negative value identifies unmet
+demand, zero reaches the cap, and a positive value records signal above the cap.
 
 Use the [running instance](problem.md#signal-from-the-selected-emitters) with
 selection $(1,1,0,0)^\top$. Its point features are:
 
-| Point $i$ | Position $x_i$ | Weight $w_i$ | Selected $z_i$ | Signal $r_i$ | Margin $r_i-\tau$ |
-| --- | --- | --- | --- | --- | --- |
-| 1 | $0$ | $1$ | $1$ | $1.5$ | $1$ |
-| 2 | $0.5$ | $1$ | $1$ | $1.5$ | $1$ |
-| 3 | $1$ | $1$ | $0$ | $0.5$ | $0$ |
-| 4 | $1.5$ | $1$ | $0$ | $0$ | $-0.5$ |
+| Point $i$ | Position | Weight | Selected | Signal | Source demand | Derived margin |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | $0$ | $1$ | $1$ | $1.5$ | $1$ | $0.5$ |
+| 2 | $0.5$ | $1$ | $1$ | $1.5$ | $1.25$ | $0.25$ |
+| 3 | $1$ | $1$ | $0$ | $0.5$ | $0.75$ | $-0.25$ |
+| 4 | $1.5$ | $1$ | $0$ | $0$ | $1$ | $-1$ |
 
-For example, $v_4=[1.5,1,0,0,-0.5]$ has five entries because this instance
-has $D=1$. Stacking all feature vectors produces an $N\times(D+4)$ input matrix.
+For example, $v_4=[1.5,1,0,0,-1]$ has five entries because this instance
+has $D=1$. The demand column above is source context, not an extra input entry.
+Stacking the five-entry vectors produces an $N\times(D+4)$ input matrix.
 The environment has already calculated the signal before the policy receives it.
 
 The baseline assumes a fixed, known decay law for a run. These features include
@@ -181,7 +185,7 @@ Attention weights over the N points
 Weighted mixture of their value vectors
 ```
 
-For our underserved point 4, this mechanism allows its representation to use
+For point 4, whose demand margin is negative, this mechanism allows its representation to use
 information about selected emitters and possible alternatives. Which information
 it uses is learned. The attention weights combine information; the policy's
 later pointer distributions select points for an exchange.
@@ -212,30 +216,29 @@ The policy retains $H$ for the pointer decoder. The pooled vector supplies a
 compact summary for decisions about the whole action.
 
 The remaining budget also affects the decision. Let $h$ be the number of
-decisions remaining, $T$ the episode horizon, and $b\in\{0,1\}$ the feasibility
-indicator. A learned projection combines them with the pooled vector:
+decisions remaining and $T$ the episode horizon. A learned projection combines
+the fraction $h/T$ with the pooled vector:
 
 $$
-g=\psi\left([\bar h,h/T,b]\right)\in\mathbb R^d,
-\qquad \psi:\mathbb R^{d+2}\to\mathbb R^d.
+g=\psi\left([\bar h,h/T]\right)\in\mathbb R^d,
+\qquad \psi:\mathbb R^{d+1}\to\mathbb R^d.
 $$
 
 ```text
 Mean point representation [d] ---+
-Remaining budget fraction h/T --+--> concatenate [d+2] --> psi --> g [d]
-Feasibility b ------------------+
+Remaining budget fraction h/T --+--> concatenate [d+1] --> psi --> g [d]
 ```
 
-The global projection uses two affine layers, with widths $d+2\to d\to d$
+The global projection uses two affine layers, with widths $d+1\to d\to d$
 and a GELU activation between them.
 
-In our starting example, $b=0$ because receiver 4 is underserved. The fraction
-$h/T$ tells the policy how much opportunity remains to change that selection.
+The fraction $h/T$ tells the policy how much opportunity remains to change the
+selection. The signed point margins carry demand information into $H$.
 We now have the global representation needed for the stop and count heads.
 
 ## 5. Decide whether to stop
 
-The stop head produces two logits, one for stop and one for continue:
+The stop head produces two raw logits, one for continue and one for stop:
 
 $$
 \lambda^{\mathrm{stop}}=gW_{\mathrm{stop}}+\beta_{\mathrm{stop}}
@@ -244,12 +247,17 @@ $$
 $$
 
 A logit is an unnormalized score. Softmax converts the two scores into a
-categorical distribution. If $b=0$, replace the stop logit with $-\infty$
-first, giving stop probability zero and continue probability one.
+categorical distribution:
 
-Our initial example is infeasible, so it must continue. For a feasible
-selection, either outcome can be sampled. A sampled stop emits a zero exchange
-and ends action construction; the count and point choices are skipped.
+$$
+P(\mathrm{stop}\mid o)=
+\frac{\exp(\lambda^{\mathrm{stop}}_1)}
+{\exp(\lambda^{\mathrm{stop}}_0)+\exp(\lambda^{\mathrm{stop}}_1)}.
+$$
+
+Continue and stop remain available for every demand state. A sampled stop emits
+a zero exchange and ends action construction; the count and point choices are
+skipped.
 The [environment](environment.md#continuing-without-edits-and-stopping) defines
 the resulting episode termination.
 
@@ -283,7 +291,7 @@ The policy has committed to one removal and one addition. It has not yet chosen
 which points participate.
 
 If $m=0$, action construction ends with a continuing no-op. In particular,
-$M=0$, $K=0$, or $K=N$ forces every continuing action to have count zero.
+$M=0$, $K=0$, or $K=N$ makes count zero the only continuing choice.
 The positive-count decoder below is entered only when $m>0$.
 
 ## 7. Initialize the decoder's memory
@@ -350,13 +358,13 @@ $$
 -\infty,&z_i=0,\end{cases}
 \qquad
 p_{1,i}=\operatorname{softmax}_i(\widetilde L_1),
-\qquad u_1\sim\operatorname{Categorical}(p_1).
+\qquad j_1\sim\operatorname{Categorical}(p_1).
 $$
 
 In the running example, the selected set is $\{1,2\}$. To illustrate the
 sampling process, suppose the distribution assigns probabilities $0.3$ and
 $0.7$ to those points. Points 3 and 4 have probability zero. Suppose point 2
-is sampled, so $u_1=2$.
+is sampled, so $j_1=2$.
 
 These probabilities and choices are illustrative, not outputs of a trained
 model. We have recorded a planned removal, but the selection is still
@@ -368,7 +376,7 @@ A gated recurrent unit (GRU) updates the decoder memory using the chosen point's
 representation and the current phase:
 
 $$
-c_1=\operatorname{GRUCell}_\theta([H_{u_1,:},e_{\mathrm{remove}}],c_0)
+c_1=\operatorname{GRUCell}_\theta([H_{j_1,:},e_{\mathrm{remove}}],c_0)
 \in\mathbb R^d.
 $$
 
@@ -430,16 +438,16 @@ L_{\ell,i}=\frac{\langle q_\ell W_Q,\kappa_i\rangle}{\sqrt{d_k}},
 $$
 
 $$
-c_\ell=\operatorname{GRUCell}_\theta([H_{u_\ell,:},e_{\phi_\ell}],c_{\ell-1}).
+c_\ell=\operatorname{GRUCell}_\theta([H_{j_\ell,:},e_{\phi_\ell}],c_{\ell-1}).
 $$
 
-Before sampling $u_\ell$, exclude points already chosen in the same phase.
+Before sampling $j_\ell$, exclude points already chosen in the same phase.
 Writing $z$ for the original selection throughout this loop, the legal sets are
 
 $$
 \mathcal I_\ell=\begin{cases}
-\{i:z_i=1\}\setminus\{u_1,\ldots,u_{\ell-1}\},&1\leq\ell\leq m,\\
-\{i:z_i=0\}\setminus\{u_{m+1},\ldots,u_{\ell-1}\},&m<\ell\leq2m.
+\{i:z_i=1\}\setminus\{j_1,\ldots,j_{\ell-1}\},&1\leq\ell\leq m,\\
+\{i:z_i=0\}\setminus\{j_{m+1},\ldots,j_{\ell-1}\},&m<\ell\leq2m.
 \end{cases}
 $$
 
@@ -447,7 +455,7 @@ An empty history excludes nothing. Define $\mu_{\ell,i}=0$ when
 $i\in\mathcal I_\ell$ and $-\infty$ otherwise. The general point distribution is
 
 $$
-P_\theta(u_\ell=i\mid o,\mathrm{continue},m,u_{<\ell})
+P_\theta(j_\ell=i\mid o,\mathrm{continue},m,j_{<\ell})
 =\operatorname{softmax}_i(L_\ell+\mu_\ell).
 $$
 
@@ -457,8 +465,8 @@ that each phase has enough eligible points to finish.
 
 ## 12. Submit one complete exchange
 
-The ordered choices determine removal set $\mathcal R=\{u_1,\ldots,u_m\}$
-and addition set $\mathcal C=\{u_{m+1},\ldots,u_{2m}\}$. Convert them to the
+The ordered choices determine removal set $\mathcal R=\{j_1,\ldots,j_m\}$
+and addition set $\mathcal C=\{j_{m+1},\ldots,j_{2m}\}$. Convert them to the
 [signed exchange](environment.md#one-continuing-action) and submit it with
 continue. The environment then applies every edit simultaneously.
 
@@ -472,7 +480,7 @@ Environment selection before: [1,1,0,0]
 Environment selection after:  [1,0,0,1]
 ```
 
-The [environment reward example](environment.md#score-and-reward) evaluates
+The [environment reward example](environment.md#utility-and-reward) evaluates
 this exact transition. No reward was produced between the removal choice and
 the addition choice. At the next active observation, the encoder runs again
 and any new decoder starts with fresh memory.
@@ -480,42 +488,43 @@ and any new decoder starts with fresh memory.
 ## 13. Assign a probability to the complete choice sequence
 
 Training needs the probability of the choices that produced an environment
-action. Call the ordered trace $U$. For our example,
-$U=(\mathrm{continue},1,2,4)$ records the branch, pair count, removal, and addition.
+action. Call the ordered trace $\xi$. For our example,
+$\xi=(\mathrm{continue},1,2,4)$ records the branch, pair count, removal, and addition.
 
 Its probability is a product of conditional probabilities:
 
 $$
 \begin{aligned}
-\pi_\theta(U\mid o)
+\pi_\theta(\xi\mid o)
 ={}&P_\theta(\mathrm{continue}\mid o)\,
 P_\theta(m=1\mid o,\mathrm{continue})\\
-&\times P_\theta(u_1=2\mid o,\mathrm{continue},1)\\
-&\times P_\theta(u_2=4\mid o,\mathrm{continue},1,u_1=2).
+&\times P_\theta(j_1=2\mid o,\mathrm{continue},1)\\
+&\times P_\theta(j_2=4\mid o,\mathrm{continue},1,j_1=2).
 \end{aligned}
 $$
 
-The infeasible initial selection makes the continue probability 1. If the
-illustrative count probability is $0.6$, the illustrative trace probability
-is $1\times0.6\times0.7\times0.8=0.336$. This assumes at least counts 0 and 1
-are legal; it specifies no learned parameter values.
+The branch probability is learned because continue and stop remain available.
+If the illustrative branch, count, and point probabilities are $0.9$, $0.6$,
+$0.7$, and $0.8$, the trace probability is
+$0.9\times0.6\times0.7\times0.8=0.3024$. These values specify no learned
+parameters.
 
 For a general continuing trace with $m>0$, the chain rule gives
 
 $$
-\pi_\theta(U\mid o)=P_\theta(\mathrm{continue}\mid o)
+\pi_\theta(\xi\mid o)=P_\theta(\mathrm{continue}\mid o)
 P_\theta(m\mid o,\mathrm{continue})
-\prod_{\ell=1}^{2m}P_\theta(u_\ell\mid o,\mathrm{continue},m,u_{<\ell}).
+\prod_{\ell=1}^{2m}P_\theta(j_\ell\mid o,\mathrm{continue},m,j_{<\ell}).
 $$
 
 Taking logarithms turns the product into a sum:
 
 $$
 \begin{aligned}
-\log\pi_\theta(U\mid o)
+\log\pi_\theta(\xi\mid o)
 ={}&\log P_\theta(\mathrm{continue}\mid o)
 +\log P_\theta(m\mid o,\mathrm{continue})\\
-&+\sum_{\ell=1}^{2m}\log P_\theta(u_\ell\mid o,\mathrm{continue},m,u_{<\ell}).
+&+\sum_{\ell=1}^{2m}\log P_\theta(j_\ell\mid o,\mathrm{continue},m,j_{<\ell}).
 \end{aligned}
 $$
 
@@ -533,7 +542,7 @@ exchange; the baseline does not perform that sum.
 
 One environment action has one reward, even when its trace contains several
 internal choices. Restore the environment time index $t$: the observation is
-$o_t$, the trace is $U_t$, and the complete action receives $R_t$.
+$o_t$, the trace is $\xi_t$, and the complete action receives $R_t$.
 
 The value head uses the same global representation as the action heads:
 
@@ -552,7 +561,7 @@ V^\pi(o_t)=\mathbb E_\pi\left[
 $$
 
 The equality follows from the [telescoping return](environment.md#return-over-an-episode).
-The value estimate concerns future score change. It is not a certificate of
+The value estimate concerns future utility change. It is not a certificate of
 the best achievable solution.
 
 For the PPO update, retain the sampled trace and its log probability under the
@@ -560,10 +569,10 @@ policy that collected it, with parameters $\theta_{\mathrm{old}}$.
 Reevaluate the trace with parameters $\theta$ to form the likelihood ratio
 
 $$
-\rho_t(\theta)=\frac{\pi_\theta(U_t\mid o_t)}
-{\pi_{\theta_{\mathrm{old}}}(U_t\mid o_t)}
-=\exp\left(\log\pi_\theta(U_t\mid o_t)
--\log\pi_{\theta_{\mathrm{old}}}(U_t\mid o_t)\right).
+\rho_t(\theta)=\frac{\pi_\theta(\xi_t\mid o_t)}
+{\pi_{\theta_{\mathrm{old}}}(\xi_t\mid o_t)}
+=\exp\left(\log\pi_\theta(\xi_t\mid o_t)
+-\log\pi_{\theta_{\mathrm{old}}}(\xi_t\mid o_t)\right).
 $$
 
 This compares how likely the same sequence is under the two policies.
@@ -588,7 +597,8 @@ per head and layer. The environment also stores $N^2$ contributions.
 Avoiding exchange enumeration does not establish a wall-clock speedup.
 
 The masks enforce valid membership and distinct choices, with equal removal
-and addition counts. They cannot ensure improvement or feasibility. The GRU
+and addition counts. They cannot guarantee utility improvement or demand
+satisfaction. The GRU
 compresses the choice history into a fixed-width memory, which may limit its
 usefulness for large exchanges. A decoder with explicit history would be a
 separate architectural variant.
@@ -601,8 +611,9 @@ inference budget. This proposed architecture has no measured performance claim.
 | Symbol | Meaning | Dimension or range |
 | --- | --- | --- |
 | $o$ | Active observation of one instance | Fixed instance and current episode quantities |
-| $N,D,K,M,T,\tau$ | Problem and episode parameters | Defined in [problem](problem.md) and [environment](environment.md) |
-| $h,b$ | Remaining decisions and feasibility indicator | Scalar integer and $\{0,1\}$ |
+| $N,D,K,M,T$ | Problem and episode parameters | Defined in [problem](problem.md) and [environment](environment.md) |
+| $h$ | Remaining decisions | Scalar integer in $[0,T]$ |
+| $u$ | Receiver demand caps | $\mathbb R_{\geq0}^N$ |
 | $v_i$ | Features of point $i$ | $\mathbb R^{D+4}$ |
 | $E,H$ | Embedded and contextualized points | $\mathbb R^{N\times d}$ |
 | $d,L_{\mathrm{enc}},h_{\mathrm{enc}}$ | Model width, encoder depth, and head count | Symbolic positive integers |
@@ -614,8 +625,8 @@ inference budget. This proposed architecture has no measured performance claim.
 | $c_\ell,q_\ell$ | Decoder memory and query | $\mathbb R^d$ |
 | $\kappa_i,\chi_\ell$ | Projected point key and query | $\mathbb R^{d_k}$ |
 | $L_\ell,\mu_\ell$ | Point logits and eligibility mask | $N$ entries |
-| $u_\ell$ | Chosen point | Integer in $\{1,\ldots,N\}$ |
-| $U,\pi_\theta(U\mid o)$ | Ordered trace and its probability | Branch-dependent sequence and scalar |
+| $j_\ell$ | Chosen point | Integer in $\{1,\ldots,N\}$ |
+| $\xi,\pi_\theta(\xi\mid o)$ | Ordered trace and its probability | Branch-dependent sequence and scalar |
 | $t$ | Environment decision index | Distinct from internal index $\ell$ |
 | $V_\theta,\rho_t$ | Learned value estimate and PPO likelihood ratio | Scalars |
 
