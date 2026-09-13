@@ -5,6 +5,10 @@ pointer decoder. Construct `EmitterPolicy(*, encoder, heads, decoder)` from
 existing modules. The heads and decoder must share an exchange cap or
 construction raises `ValueError`.
 
+The value output estimates future net return, including the fixed cost charged
+by each continuing environment action. A stop earns zero reward; the
+environment owns the transition and completion flags.
+
 ## Generation and replay
 
 `policy(observation, *, greedy=False)` returns `(action, trace, log_prob, value)`.
@@ -33,9 +37,14 @@ the environment. The action's stop tensor is independent of the retained trace.
 ## Usage
 
 Use the [encoder example](transformer_encoder.md#usage) to supply
-`encoder`, `config`, `observation`, and `env`:
+`encoder`, `config`, `observation`, and `env`. This example has one batch row.
+Skip a row marked `info["succeeded"]` after reset; for a mixed batch, gather
+active rows before calling the policy and scatter the resulting actions back to
+the environment batch.
 
 ```python
+import torch
+
 from models.policy import EmitterPolicy
 from models.policy_heads import PolicyHeads
 from models.pointer_decoder import PointerDecoder
@@ -46,9 +55,10 @@ policy = EmitterPolicy(
     heads=PolicyHeads(model_dim=d, max_exchanges=M),
     decoder=PointerDecoder(model_dim=d, max_exchanges=M),
 ).to(observation["points"])
-with torch.no_grad():
-    action, trace, log_prob, value = policy(observation)
-    replay_log_prob, replay_value = policy.evaluate(observation, trace)
-torch.testing.assert_close(log_prob, replay_log_prob)
-next_observation, reward, terminated, truncated, info = env.step(action)
+if not bool(info["succeeded"].all()):
+    with torch.no_grad():
+        action, trace, log_prob, value = policy(observation)
+        replay_log_prob, replay_value = policy.evaluate(observation, trace)
+    torch.testing.assert_close(log_prob, replay_log_prob)
+    next_observation, reward, terminated, truncated, info = env.step(action)
 ```

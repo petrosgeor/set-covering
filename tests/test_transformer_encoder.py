@@ -8,7 +8,7 @@ import torch
 from torch import Tensor
 
 from envs.emitter import BatchedEmitterEnv, EnvConfig
-from models.transformer_encoder import EncoderConfig, TransformerEncoder, load_config
+from models.transformer_encoder import EncoderConfig, TransformerEncoder
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,37 +19,25 @@ def make_model(
     dtype: torch.dtype = torch.float32,
     device: str | torch.device = "cpu",
     num_layers: int = 2,
-    max_steps: int = 7,
 ) -> TransformerEncoder:
     """Build the small encoder used by these tests."""
     config = EncoderConfig(8, num_layers, 2, 16)
-    return TransformerEncoder(
-        config=config,
-        coordinate_dim=coordinate_dim,
-        max_steps=max_steps,
-    ).to(device=device, dtype=dtype)
+    return TransformerEncoder(config=config, coordinate_dim=coordinate_dim).to(device=device, dtype=dtype)
 
 
 def observation() -> dict[str, Tensor]:
     """Return two concrete point sets with heterogeneous receiver demands."""
     return {
-        "points": torch.tensor(
-            [[[0.0, 0.1], [0.5, 0.6], [1.0, 1.1]], [[0.2, 0.3], [0.7, 0.8], [1.2, 1.3]]]
-        ),
+        "points": torch.tensor([[[0.0, 0.1], [0.5, 0.6], [1.0, 1.1]], [[0.2, 0.3], [0.7, 0.8], [1.2, 1.3]]]),
         "weights": torch.tensor([[1.0, 0.5, 1.5], [0.75, 1.25, 0.25]]),
         "selected": torch.tensor([[True, False, True], [False, True, False]]),
         "received_signal": torch.tensor([[0.8, 0.9, 1.0], [0.4, 0.75, 1.0]]),
         "demands": torch.tensor([[0.6, 1.0, 1.2], [0.5, 0.8, 1.1]]),
         "steps_remaining": torch.tensor([4, 2], dtype=torch.int64),
         "contributions": torch.tensor(
-            [
-                [[1.0, 0.1, 0.2], [0.1, 1.0, 0.3], [0.2, 0.3, 1.0]],
-                [[1.0, 0.4, 0.5], [0.4, 1.0, 0.6], [0.5, 0.6, 1.0]],
-            ]
+            [[[1.0, 0.1, 0.2], [0.1, 1.0, 0.3], [0.2, 0.3, 1.0]], [[1.0, 0.4, 0.5], [0.4, 1.0, 0.6], [0.5, 0.6, 1.0]]]
         ),
     }
-
-
 
 
 def test_features() -> None:
@@ -70,14 +58,12 @@ def test_features() -> None:
     model(obs)
     hook.remove()
 
-    expected = torch.tensor(
-        [[[1.25, -2.0, 0.25, 1.0, 0.8, -0.4], [3.0, 4.0, 0.75, 0.0, 1.3, 0.3]]]
-    )
+    expected = torch.tensor([[[1.25, -2.0, 0.25, 1.0, 0.8, -0.4], [3.0, 4.0, 0.75, 0.0, 1.3, 0.3]]])
     torch.testing.assert_close(seen[0], expected)
 
 
-def test_global_features_include_mean_and_fraction() -> None:
-    """Global features contain the point mean and remaining-step fraction."""
+def test_global_features_are_mean_embedding() -> None:
+    """The global projection receives only the mean point embedding."""
     model = make_model(coordinate_dim=2, dtype=torch.float64)
     obs = {
         key: value.to(dtype=torch.float64) if value.is_floating_point() else value
@@ -90,14 +76,26 @@ def test_global_features_include_mean_and_fraction() -> None:
     point_embeddings, _ = model(obs)
     hook.remove()
 
-    expected = torch.cat(
-        (
-            point_embeddings.mean(dim=1),
-            obs["steps_remaining"].to(torch.float64).unsqueeze(-1) / 7,
-        ),
-        dim=-1,
-    )
+    expected = point_embeddings.mean(dim=1)
     torch.testing.assert_close(seen[0], expected)
+
+
+def test_legacy_timer_does_not_change_outputs() -> None:
+    """The encoder works without a timer and ignores a legacy timer field."""
+    model = make_model(dtype=torch.float64).eval()
+    obs = {
+        key: value.to(dtype=torch.float64) if value.is_floating_point() else value
+        for key, value in observation().items()
+    }
+    without_timer = {key: value for key, value in obs.items() if key != "steps_remaining"}
+    changed = dict(without_timer)
+    changed["steps_remaining"] = torch.tensor([0, 99], dtype=torch.int64)
+
+    with torch.no_grad():
+        points, global_embedding = model(without_timer)
+        changed_points, changed_global = model(changed)
+    torch.testing.assert_close(changed_points, points)
+    torch.testing.assert_close(changed_global, global_embedding)
 
 
 @pytest.mark.parametrize("coordinate_dim", [1, 2, 3])
@@ -168,24 +166,19 @@ def test_layers_are_independent_and_seed_reproducible() -> None:
     config = EncoderConfig(8, 3, 2, 16)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(314159)
-        first = TransformerEncoder(config=config, coordinate_dim=2, max_steps=7)
+        first = TransformerEncoder(config=config, coordinate_dim=2)
         torch.manual_seed(314159)
-        second = TransformerEncoder(config=config, coordinate_dim=2, max_steps=7)
+        second = TransformerEncoder(config=config, coordinate_dim=2)
 
         assert all(
-            torch.equal(left, right)
-            for left, right in zip(
-                first.state_dict().values(), second.state_dict().values()
-            )
+            torch.equal(left, right) for left, right in zip(first.state_dict().values(), second.state_dict().values())
         )
         for left_layer, right_layer in pairwise(first.layers):
             for left, right in zip(left_layer.parameters(), right_layer.parameters()):
                 assert left.data_ptr() != right.data_ptr()
         assert any(
             not torch.equal(left, right)
-            for left, right in zip(
-                first.layers[0].parameters(), first.layers[1].parameters()
-            )
+            for left, right in zip(first.layers[0].parameters(), first.layers[1].parameters())
             if left.ndim >= 2
         )
 
@@ -202,9 +195,7 @@ def test_gradients(loss_kind: str, dtype: torch.dtype, device_name: str) -> None
         torch.manual_seed(20260906)
         model = make_model(dtype=dtype, device=device).train()
     obs = {
-        key: value.to(device=device, dtype=dtype)
-        if value.is_floating_point()
-        else value.to(device=device)
+        key: value.to(device=device, dtype=dtype) if value.is_floating_point() else value.to(device=device)
         for key, value in observation().items()
     }
     points, global_embedding = model(obs)
@@ -224,34 +215,16 @@ def test_gradients(loss_kind: str, dtype: torch.dtype, device_name: str) -> None
 
 def test_environment_reset_observation() -> None:
     """A real environment reset observation can pass through the encoder."""
-    points = torch.tensor(
-        [[[0.0], [0.5], [1.0], [1.5]], [[0.2], [0.7], [1.2], [1.7]]],
-        dtype=torch.float32,
-    )
-    config = EnvConfig(
-        num_emitters=2,
-        max_exchanges=1,
-        max_steps=4,
-        seed=17,
-        device="cpu",
-    )
-    demands = torch.tensor(
-        [[0.5, 0.7, 1.1, 1.4], [0.6, 0.8, 1.0, 1.2]], dtype=torch.float32
-    )
-    env = BatchedEmitterEnv(
-        points,
-        torch.ones(2, 4),
-        config,
-        demands=demands,
-    )
+    points = torch.tensor([[[0.0], [0.5], [1.0], [1.5]], [[0.2], [0.7], [1.2], [1.7]]], dtype=torch.float32)
+    config = EnvConfig(num_emitters=2, max_exchanges=1, max_steps=4, step_cost=0.1, seed=17, device="cpu")
+    demands = torch.tensor([[0.5, 0.7, 1.1, 1.4], [0.6, 0.8, 1.0, 1.2]], dtype=torch.float32)
+    env = BatchedEmitterEnv(points, torch.ones(2, 4), config, demands=demands)
     obs, info = env.reset(seed=23)
     contributions = obs["contributions"]
     assert contributions.shape == (2, 4, 4)
-    torch.testing.assert_close(
-        contributions.diagonal(dim1=-2, dim2=-1), torch.ones(2, 4), rtol=0, atol=0
-    )
+    torch.testing.assert_close(contributions.diagonal(dim1=-2, dim2=-1), torch.ones(2, 4), rtol=0, atol=0)
     torch.testing.assert_close(contributions[:, 0, 1], torch.full((2,), -0.5).exp())
-    encoded_points, global_embedding = make_model(1, max_steps=4)(obs)
+    encoded_points, global_embedding = make_model(1)(obs)
     assert encoded_points.shape == (2, 4, 8)
     assert global_embedding.shape == (2, 8)
     assert info["objective"].shape == (2,)

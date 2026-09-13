@@ -32,9 +32,16 @@ explicit = true
 
 [tool.ruff]
 target-version = "py312"
+line-length = 120
+
+[tool.ruff.format]
+skip-magic-trailing-comma = true
 
 [tool.ruff.lint]
 extend-select = ["D"]
+
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

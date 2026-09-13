@@ -20,17 +20,13 @@ class PointerDecoder(nn.Module):
         """
         super().__init__()
         self.max_exchanges = max_exchanges
-        self.count_embedding = nn.Embedding(max_exchanges + 1, model_dim)
+        self.count_embedding = nn.Embedding(max_exchanges + 1, model_dim)   # this is max exhanges + 1 because we can have zero exchanges
         self.phase_embedding = nn.Embedding(2, model_dim)
         self.initial_memory = nn.Sequential(
-            nn.Linear(2 * model_dim, model_dim),
-            nn.GELU(),
-            nn.Linear(model_dim, model_dim),
+            nn.Linear(2 * model_dim, model_dim), nn.GELU(), nn.Linear(model_dim, model_dim)
         )
         self.query_network = nn.Sequential(
-            nn.Linear(2 * model_dim + 1, model_dim),
-            nn.GELU(),
-            nn.Linear(model_dim, model_dim),
+            nn.Linear(2 * model_dim + 1, model_dim), nn.GELU(), nn.Linear(model_dim, model_dim)
         )
         self.query_projection = nn.Linear(model_dim, model_dim, bias=False)
         self.key_projection = nn.Linear(model_dim, model_dim, bias=False)
@@ -98,9 +94,7 @@ class PointerDecoder(nn.Module):
             Conditional log probabilities [B] for the supplied order, with zero
             for empty traces. Inputs are trusted, unchanged, and not detached.
         """
-        _, _, log_prob = self._decode(
-            H, g, selected, counts, greedy=False, choices=(removals, additions)
-        )
+        _, _, log_prob = self._decode(H, g, selected, counts, greedy=False, choices=(removals, additions))
         return log_prob
 
     def _decode(
@@ -116,9 +110,7 @@ class PointerDecoder(nn.Module):
         batch_size = H.shape[0]
         # Each row uses only its first counts[b] entries.
         # Remaining entries stay -1 and never participate in decoding or scoring.
-        removals = torch.full(
-            (batch_size, self.max_exchanges), -1, dtype=torch.int64, device=H.device
-        )
+        removals = torch.full((batch_size, self.max_exchanges), -1, dtype=torch.int64, device=H.device)
         additions = torch.full_like(removals, -1)
         # Keep empty traces differentiable, with exactly zero input gradients.
         log_prob = (H * 0).sum(dim=(1, 2)) + (g * 0).sum(dim=-1)
@@ -130,9 +122,7 @@ class PointerDecoder(nn.Module):
         point_embeddings = H[positive_rows]
         pair_counts = counts[positive_rows]
         original_selection = selected[positive_rows]
-        memory = self.initial_memory(
-            torch.cat((g[positive_rows], self.count_embedding(pair_counts)), dim=-1)
-        )
+        memory = self.initial_memory(torch.cat((g[positive_rows], self.count_embedding(pair_counts)), dim=-1))
         keys = self.key_projection(point_embeddings)
 
         # Complete every removal before starting additions, retaining the memory.
@@ -144,27 +134,13 @@ class PointerDecoder(nn.Module):
                 if active.numel() == 0:
                     break
                 batch_rows = positive_rows[active]
-                phase_vectors = self.phase_embedding.weight[phase].expand(
-                    active.numel(), -1
-                )
-                remaining_fraction = (pair_counts[active] - step).to(
-                    dtype=H.dtype
-                ) / pair_counts[active]
+                phase_vectors = self.phase_embedding.weight[phase].expand(active.numel(), -1)
+                remaining_fraction = (pair_counts[active] - step).to(dtype=H.dtype) / pair_counts[active]
                 query = self.query_network(
-                    torch.cat(
-                        (
-                            memory[active],
-                            phase_vectors,
-                            remaining_fraction.unsqueeze(-1),
-                        ),
-                        dim=-1,
-                    )
+                    torch.cat((memory[active], phase_vectors, remaining_fraction.unsqueeze(-1)), dim=-1)
                 )
                 projected_query = self.query_projection(query)
-                logits = (
-                    torch.bmm(keys[active], projected_query.unsqueeze(-1)).squeeze(-1)
-                    / self.score_scale
-                )
+                logits = torch.bmm(keys[active], projected_query.unsqueeze(-1)).squeeze(-1) / self.score_scale
                 logits = logits.masked_fill(~eligible[active], -torch.inf)
                 distribution = Categorical(logits=logits)
 
@@ -175,14 +151,9 @@ class PointerDecoder(nn.Module):
                 else:
                     chosen = distribution.sample()
 
-                log_prob = log_prob.index_add(
-                    0, batch_rows, distribution.log_prob(chosen)
-                )
+                log_prob = log_prob.index_add(0, batch_rows, distribution.log_prob(chosen))
                 chosen_embeddings = point_embeddings[active, chosen]
-                next_memory = self.gru(
-                    torch.cat((chosen_embeddings, phase_vectors), dim=-1),
-                    memory[active],
-                )
+                next_memory = self.gru(torch.cat((chosen_embeddings, phase_vectors), dim=-1), memory[active])
                 memory = memory.index_copy(0, active, next_memory)
                 output[batch_rows, step] = chosen
                 eligible[active, chosen] = False

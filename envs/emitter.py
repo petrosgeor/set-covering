@@ -4,6 +4,7 @@ Each batch row is independent.
 """
 
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 
 import torch
@@ -11,23 +12,31 @@ import yaml
 from jaxtyping import Bool, Float
 from torch import Tensor
 
+SUCCESS_TOLERANCE = 1e-6
+
 
 @dataclass(frozen=True)
 class EnvConfig:
-    """Shared episode budgets, local random seed, and device."""
+    """Shared search budgets, continuation cost, local seed, and device."""
 
     num_emitters: int
     max_exchanges: int
     max_steps: int
     seed: int
     device: str
+    step_cost: float
+
+    def __post_init__(self) -> None:
+        """Require a finite, positive cost for every continuation."""
+        if not isfinite(self.step_cost) or self.step_cost <= 0:
+            raise ValueError("step_cost must be a positive finite float")
 
 
 def load_config(path: str | Path) -> EnvConfig:
     """Read a flat, explicit YAML configuration without executable loading.
 
     Args:
-        path: YAML file containing exactly the five EnvConfig fields.
+        path: YAML file containing exactly the six EnvConfig fields.
 
     Returns:
         Shared configuration, with no implicit field defaults.
@@ -68,10 +77,7 @@ class BatchedEmitterEnv:
 
     @torch.no_grad()
     def reset(
-        self,
-        *,
-        seed: int | None = None,
-        mask: Bool[Tensor, "B"] | None = None,
+        self, *, seed: int | None = None, mask: Bool[Tensor, "B"] | None = None
     ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
         """Restart selected rows and return the full batch.
 
@@ -84,15 +90,16 @@ class BatchedEmitterEnv:
 
         Returns:
             Full observation and info dictionaries, including unchanged rows.
+            Rows with weighted unmet demand at most 1e-6 are already complete;
+            exclude rows marked ``info["succeeded"]`` from action collection.
         """
         batch_size, num_points = self._points.shape[:2]
         if mask is None:
             mask = torch.ones(batch_size, dtype=torch.bool, device=self._device)
             self._selected = torch.zeros_like(self._weights, dtype=torch.bool)
-            self._steps_remaining = torch.zeros(
-                batch_size, dtype=torch.int64, device=self._device
-            )
+            self._steps_remaining = torch.zeros(batch_size, dtype=torch.int64, device=self._device)
             self._stopped = torch.zeros_like(mask)
+            self._succeeded = torch.zeros_like(mask)
             self._timed_out = torch.zeros_like(mask)
 
         if mask.any():
@@ -112,21 +119,18 @@ class BatchedEmitterEnv:
             self._selected[mask] = selected
             self._steps_remaining[mask] = self.config.max_steps
             self._stopped[mask] = False
+            self._succeeded[mask] = False
             self._timed_out[mask] = False
 
         observation = self._get_observation()
+        _, weighted_unmet_demand = self._evaluate_observation(observation)
+        self._succeeded[mask] = weighted_unmet_demand[mask] <= SUCCESS_TOLERANCE
         return observation, self._get_info(observation)
 
     @torch.no_grad()
     def step(
         self, action: dict[str, Tensor]
-    ) -> tuple[
-        dict[str, Tensor],
-        Float[Tensor, "B"],
-        Bool[Tensor, "B"],
-        Bool[Tensor, "B"],
-        dict[str, Tensor],
-    ]:
+    ) -> tuple[dict[str, Tensor], Float[Tensor, "B"], Bool[Tensor, "B"], Bool[Tensor, "B"], dict[str, Tensor]]:
         """Apply simultaneous exchanges and reward the change in objective.
 
         Args:
@@ -137,67 +141,54 @@ class BatchedEmitterEnv:
 
         Returns:
             Observation, reward, terminated, truncated, and info. Explicit stops
-            and the task horizon terminate a row; truncated is always false.
+            and weighted unmet demand at most 1e-6 terminate a row. The external
+            step limit truncates an active row unless it stops or succeeds.
         """
         observation = self._get_observation()
         exchanges, stop = action["exchanges"], action["stop"]
-        active = ~(self._stopped | self._timed_out)
-        stopping = active & stop
-        continuing = active & ~stop
+        active: Bool[Tensor, "B"] = ~(self._stopped | self._succeeded | self._timed_out)
+        stopping: Bool[Tensor, "B"] = active & stop
+        continuing: Bool[Tensor, "B"] = active & ~stop
 
         self._selected = torch.where(
-            continuing[:, None],
-            (self._selected | (exchanges == 1)) & (exchanges != -1),
-            self._selected,
+            continuing[:, None], (self._selected | (exchanges == 1)) & (exchanges != -1), self._selected
         )
         self._steps_remaining = self._steps_remaining - active.to(torch.int64)
         self._stopped = self._stopped | stopping
-        self._timed_out = self._timed_out | (continuing & (self._steps_remaining == 0))
 
         next_observation = self._get_observation()
-        reward = self._get_reward(observation, next_observation)
-        terminated = self._stopped | self._timed_out
-        truncated = torch.zeros_like(terminated)
-        return (
-            next_observation,
-            reward,
-            terminated,
-            truncated,
-            self._get_info(next_observation),
-        )
+        _, weighted_unmet_demand = self._evaluate_observation(next_observation)
+        succeeded: Bool[Tensor, "B"] = continuing & (weighted_unmet_demand <= SUCCESS_TOLERANCE)
+        self._succeeded = self._succeeded | succeeded
+        self._timed_out = self._timed_out | (continuing & ~succeeded & (self._steps_remaining <= 0))
+
+        reward = self._get_reward(observation, next_observation, continuing)
+        terminated = self._stopped | self._succeeded
+        truncated = self._timed_out.clone()
+        return (next_observation, reward, terminated, truncated, self._get_info(next_observation))
 
     def _build_contributions(self) -> Float[Tensor, "B N N"]:
-        distances = torch.cdist(
-            self._points,
-            self._points,
-            p=2,
-            compute_mode="donot_use_mm_for_euclid_dist",
-        )
+        distances = torch.cdist(self._points, self._points, p=2, compute_mode="donot_use_mm_for_euclid_dist")
         distances.diagonal(dim1=-2, dim2=-1).zero_()
         return torch.exp(-distances)
 
-    def _evaluate_observation(
-        self, observation: dict[str, Tensor]
-    ) -> tuple[
-        Float[Tensor, "B"],
-        Float[Tensor, "B"],
-    ]:
+    def _evaluate_observation(self, observation: dict[str, Tensor]) -> tuple[Float[Tensor, "B"], Float[Tensor, "B"]]:
         received_signal = observation["received_signal"]
         capped_signal = torch.minimum(received_signal, observation["demands"])
         objective = (observation["weights"] * capped_signal).sum(dim=1)
-        weighted_unmet_demand = (
-            observation["weights"]
-            * (observation["demands"] - received_signal).clamp_min(0)
-        ).sum(dim=1)
+        weighted_unmet_demand = (observation["weights"] * (observation["demands"] - received_signal).clamp_min(0)).sum(
+            dim=1
+        )
         return objective, weighted_unmet_demand
 
     def _get_reward(
-        self, observation: dict[str, Tensor], next_observation: dict[str, Tensor]
+        self, observation: dict[str, Tensor], next_observation: dict[str, Tensor], continuing: Bool[Tensor, "B"]
     ) -> Float[Tensor, "B"]:
-        """Return the objective difference, including on the final transition."""
+        """Return objective improvement minus the cost of each continuation."""
         objective, _ = self._evaluate_observation(observation)
         next_objective, _ = self._evaluate_observation(next_observation)
-        return next_objective - objective
+        improvement = next_objective - objective
+        return torch.where(continuing, improvement - self.config.step_cost, torch.zeros_like(improvement))
 
     def _get_observation(self) -> dict[str, Tensor]:
         """Return dynamic snapshots and borrowed read-only instance tensors."""
@@ -211,7 +202,6 @@ class BatchedEmitterEnv:
             "contributions": self._contributions,
             "selected": self._selected.clone(),
             "received_signal": received_signal,
-            "steps_remaining": self._steps_remaining.clone(),
         }
 
     def _get_info(self, observation: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -220,5 +210,7 @@ class BatchedEmitterEnv:
             "objective": objective,
             "weighted_unmet_demand": weighted_unmet_demand,
             "stopped": self._stopped.clone(),
+            "succeeded": self._succeeded.clone(),
             "timed_out": self._timed_out.clone(),
+            "steps_remaining": self._steps_remaining.clone(),
         }

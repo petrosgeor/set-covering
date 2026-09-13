@@ -6,7 +6,9 @@ Contributions decay exponentially with Euclidean distance.
 
 This is an ongoing research project about learned local search for this
 fixed-budget placement problem. The project investigates how the action design
-and the amount of search used at inference affect the solutions we find.
+and the amount of search used at inference affect the solutions we find. A
+continuing decision earns objective improvement minus a fixed search cost; the
+collection limit is external to the policy.
 
 ## Research questions
 
@@ -37,14 +39,14 @@ requires more point selections.
 ## Status
 
 The batched PyTorch environment and transformer/GRU policy are implemented.
-PPO training and the experiments above are unfinished.
+A2C training and the experiments above are unfinished.
 Code lives in `envs/` and `models/`; YAML configuration lives in `parameters/`.
 
 ## Research documentation
 
 1. [Problem](docs/research/problem.md): formulation, signal, capped utility, and unmet demand.
 2. [Environment](docs/research/environment.md): initialization, exchanges, rewards, and episode outcome.
-3. [Model](docs/research/model.md): features, attention, policy decisions, and proposed PPO training.
+3. [Model](docs/research/model.md): features, attention, policy decisions, and the planned A2C connection.
 
 ## Code documentation
 

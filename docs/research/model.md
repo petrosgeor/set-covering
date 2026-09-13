@@ -5,10 +5,11 @@ and pointer decoder. It chooses stop or continue, chooses an exchange count,
 and constructs one environment action with its ordered trace. The
 [encoder implementation](../code/transformer_encoder.md), [policy heads](../../models/policy_heads.py),
 and [pointer decoder](../../models/pointer_decoder.py) are separate modules;
-the complete policy assembles them and evaluates supplied traces. PPO training
-remains unimplemented. Model and feed-forward widths, encoder depth, and
-attention head count are configuration parameters. The [problem](problem.md) and
-[environment](environment.md) define the task and transition semantics.
+the complete policy assembles them and evaluates supplied traces. A2C training
+is planned but remains unimplemented. Model and feed-forward widths, encoder
+depth, and attention head count are configuration parameters. The
+[problem](problem.md) and [environment](environment.md) define the task and
+transition semantics.
 
 During one action, the observation stays fixed while the decoder constructs
 the exchange. The environment changes the selection only after construction
@@ -20,7 +21,7 @@ is complete.
 Observation
     -> point features [B,N,D+4] -> shared projection
     -> transformer -> point representations H [B,N,d]
-    -> mean(H) + remaining fraction h/T -> global representation g [B,d]
+    -> mean(H) -> global representation g [B,d]
 g -> value estimate
 g -> stop -> zero exchange and episode termination
   continue -> count m -> no-op when m=0, otherwise GRU pointer
@@ -89,17 +90,17 @@ $$
 \bar h=\frac1N\sum_{i=1}^N H_{i,:}\in\mathbb R^d.
 $$
 
-The policy retains $H$ for the pointer decoder and combines $\bar h$ with the
-remaining decision fraction $h/T$:
+The policy retains $H$ for the pointer decoder and projects $\bar h$ into the
+global representation:
 
 $$
-g=\psi\left([\bar h,h/T]\right)\in\mathbb R^d,
-\qquad \psi:\mathbb R^{d+1}\to\mathbb R^d.
+g=\psi(\bar h)\in\mathbb R^d,
+\qquad \psi:\mathbb R^d\to\mathbb R^d.
 $$
 
-The global projection has widths $d+1\to d\to d$ with GELU between layers.
-The heads therefore receive a summary of the configuration and remaining
-decision budget.
+The global projection has widths $d\to d\to d$ with GELU between layers. The
+heads receive a summary of the current configuration, without the external
+collection counter.
 
 ## 5. Decide whether to stop
 
@@ -271,13 +272,13 @@ continuing zero-count trace contributes the continue and count-zero terms.
 Policy evaluation recomputes these terms from the original observation and
 supplied ordered trace without sampling.
 
-Different point orders can produce the same exchange sets. The current
-training interface scores the sampled ordered trace. PPO must replay that
-order with the same observation and masks. An unordered exchange probability
-would require summing over every trace that yields the exchange; the baseline
-does not do that.
+Different point orders can produce the same exchange sets. The planned training
+interface scores the sampled ordered trace. A2C must replay that order with the
+same observation and masks. An unordered exchange probability would require
+summing over every trace that yields the exchange; the baseline does not do
+that.
 
-## 11. Connect the trace to PPO and the value estimate
+## 11. Connect the trace to A2C and the value estimate
 
 One environment action receives one reward, even when its trace has several
 internal choices. At environment time $t$, the observation is $o_t$, the
@@ -289,32 +290,35 @@ V_\theta(o_t)=g_tw_V+\beta_V\in\mathbb R,
 \qquad w_V\in\mathbb R^d.
 $$
 
-It estimates expected future return. With $\gamma=1$,
+It estimates expected future net return, including the search cost charged by
+continuing actions. For a trajectory that reaches stop or success, with
+$\gamma=1$,
 
 $$
 V^\pi(o_t)=\mathbb E_\pi\left[
 \sum_{j=t}^{t_{\mathrm{end}}-1}R_j\,\middle|\,o_t\right]
 =\mathbb E_\pi\left[
-F(z_{t_{\mathrm{end}}})-F(z_t)\,\middle|\,o_t\right].
+F(z_{t_{\mathrm{end}}})-F(z_t)-cL_t\,\middle|\,o_t\right],
 $$
 
-The equality follows from the [telescoping return](environment.md#return-over-an-episode).
-The value is an estimate of future utility change, not a certificate of the
-best solution.
+where $L_t$ is the number of continuing actions from $t$ through the end of the
+episode. The relationship follows from the [return
+definition](environment.md#return-over-an-episode). The value is an estimate of
+future net return, not a certificate of the best solution.
 
-For PPO, retain the sampled trace and old log probability, then reevaluate the
-same trace under the current parameters:
+The first planned trainer uses A2C. A rollout records the original observation,
+the ordered trace, its complete-action reward, and the termination flags. The
+policy reevaluates the same trace under the current parameters and uses its log
+probability and value to form the actor and critic updates. A true terminal
+transition has no bootstrap term. A truncated transition bootstraps from the
+final observation returned before reset. A rollout is reset on
+`terminated | truncated`, and its return calculation cannot use rewards from
+the next episode.
 
-$$
-\rho_t(\theta)=\frac{\pi_\theta(\xi_t\mid o_t)}
-{\pi_{\theta_{\mathrm{old}}}(\xi_t\mid o_t)}
-=\exp\left(\log\pi_\theta(\xi_t\mid o_t)
--\log\pi_{\theta_{\mathrm{old}}}(\xi_t\mid o_t)\right).
-$$
-
-The advantage belongs to the complete environment action. The full PPO loss,
-advantage estimator, entropy term, and optimizer settings are unspecified;
-this design fixes the trace-likelihood and value interfaces.
+The advantage belongs to the complete environment action, even when its trace
+contains several point choices. The exact advantage estimator, entropy term,
+and optimizer settings remain unfinished; this design fixes the trace
+likelihood and value interfaces.
 
 ## Design rationale and limitations
 
@@ -342,9 +346,9 @@ a stated inference budget; the architecture has no measured performance claim.
 | Symbol | Meaning | Dimension or range |
 | --- | --- | --- |
 | $o$ | Active observation | Fixed instance and current episode quantities |
-| $N,D,K,M,T$ | Problem and episode parameters | Defined in [problem](problem.md) and [environment](environment.md) |
-| $h$ | Remaining decisions | Integer in $[0,T]$ |
+| $N,D,K,M,T$ | Problem parameters and external collection limit | Defined in [problem](problem.md) and [environment](environment.md); $T$ is not encoded |
 | $u$ | Receiver demand caps | $\mathbb R_{\geq0}^N$ |
+| $c$ | Cost of one continuing action | Positive scalar in utility units |
 | $v_i$ | Features of point $i$ | $\mathbb R^{D+4}$ |
 | $E,H$ | Embedded and contextualized points | $\mathbb R^{N\times d}$ |
 | $d,L_{\mathrm{enc}},h_{\mathrm{enc}}$ | Width, encoder depth, and head count | Symbolic positive integers |
@@ -359,7 +363,7 @@ a stated inference budget; the architecture has no measured performance claim.
 | $j_\ell$ | Chosen point | Integer in $\{1,\ldots,N\}$ |
 | $\xi,\pi_\theta(\xi\mid o)$ | Ordered trace and probability | Branch-dependent sequence and scalar |
 | $t$ | Environment decision index | Distinct from internal index $\ell$ |
-| $V_\theta,\rho_t$ | Value estimate and PPO likelihood ratio | Scalars |
+| $V_\theta$ | Value estimate | Scalar |
 
 ## Architectural precedents
 
@@ -371,5 +375,6 @@ These papers motivate the architecture but do not establish performance on
 emitter placement.
 
 [Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347)
-provides the likelihood-ratio training framework. The trace construction and
-environment reward above specify the proposed training connection.
+describes a related likelihood-ratio method. The first planned trainer here is
+A2C; the trace construction and environment reward define its proposed
+connection.

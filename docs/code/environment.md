@@ -4,10 +4,11 @@
 episodes.
 
 Construct `BatchedEmitterEnv(points, weights, config, *, demands)` with a shared
-float dtype.
-`load_config(path)` reads the five required fields from
+float dtype. `load_config(path)` reads the six required fields from
 [`environment.yaml`](../../parameters/environment.yaml): `num_emitters`,
-`max_exchanges`, `max_steps`, `seed`, and `device`.
+`max_exchanges`, `max_steps`, `seed`, `device`, and `step_cost`. The cost is a
+positive finite scalar in the same objective units as the capped utility. The
+sample value `0.1` is illustrative and untuned.
 
 ## Observation
 
@@ -19,13 +20,28 @@ float dtype.
 | `weights`, `demands`, `received_signal` | `[B,N]` | Matching float |
 | `contributions` | `[B,N,N]` | Matching float |
 | `selected` | `[B,N]` | Boolean |
-| `steps_remaining` | `[B]` | int64 |
 
 Construction detaches, moves, and clones instance tensors. Observations borrow
 these fixed tensors as read-only data and snapshot dynamic state.
 `received_signal` is the raw product `Az`. Contributions use
 `exp(-||x_i-x_j||_2)` with unit diagonal. Coordinates are used unchanged,
-without normalization or a scale parameter.
+without normalization or a scale parameter. The collection countdown is not an
+observation, so the policy cannot condition on it.
+
+## Info
+
+`reset()` and `step()` return `[B]` diagnostics in `info`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `objective`, `weighted_unmet_demand` | Matching float | Current capped utility and weighted shortfall |
+| `stopped`, `succeeded`, `timed_out` | Boolean | Completion reason for each row |
+| `steps_remaining` | int64 | External collection slots left |
+
+The success test is `weighted_unmet_demand <= 1e-6` in raw objective units. It
+therefore ignores receivers with zero weight. A row that starts in this state
+is marked `succeeded` and frozen; callers should skip it. A later `step()` on
+that row returns `terminated=True` and zero reward.
 
 ## Usage
 
@@ -49,14 +65,28 @@ observation, info = env.reset(seed=0)
 `(observation, reward, terminated, truncated, info)`. Signed integer exchanges
 `[B,N]` have equal `-1` and `+1` counts within the cap. Callers validate that
 `-1` marks selected and `+1` marks unselected points. Active stops `[B]` carry
-zero edits and end rows. Demand satisfaction does not terminate an episode.
-Demands are finite, nonnegative, fixed across resets; zero is valid.
+zero edits and end rows. A continuing exchange can end a row when the success
+test passes. Demands are finite, nonnegative, fixed across resets; zero is
+valid.
 
-Each active step consumes one decision. Stops and horizon exhaustion terminate;
-`truncated` is false; finished rows freeze with zero reward. `info`
-contains `[B]` fields `objective`, `weighted_unmet_demand`, `stopped`, and
-`timed_out`. Reward is next objective minus current objective.
+Each active call consumes one external collection slot. For a continuing action,
+including a zero-size exchange, reward is
+
+`next_objective - objective - config.step_cost`.
+
+Stopping and calls on frozen rows receive zero reward. A stop or successful
+exchange sets `terminated=True`. If the external step limit is reached after a
+continuing action without either condition, `truncated=True` and
+`terminated=False`. Success or stop takes precedence when both occur on the
+last slot.
 
 Call full `reset()` before masked reset. Record terminal observations before
 `reset(mask=terminated | truncated)`, which restarts completed rows and returns
-the full batch. `reset(seed=...)` reseeds the generator.
+the full batch. Reset rows that start successful are reported in `info` and
+must be excluded from the next policy call. `reset(seed=...)` reseeds the
+generator.
+
+An actor-critic collector resets rows on `terminated | truncated`. It must
+bootstrap a truncated row from the final observation before reset, while a
+terminated row has no bootstrap term. Return calculations must not use rewards
+from the next episode.

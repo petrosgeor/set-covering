@@ -3,3 +3,4 @@ max_exchanges: 1
 max_steps: 8
 seed: 0
 device: cpu
+step_cost: 0.1  # Illustrative and untuned.

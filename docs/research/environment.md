@@ -1,47 +1,64 @@
 # Searching through emitter exchanges
 
-An episode starts with a selection of $K$ emitters and gives the policy at most
-$T$ decisions to change it. Each continuing action exchanges equally many
-selected and unselected points. The final selection determines the outcome.
+An episode starts with a selection of $K$ emitters. The policy can change that
+selection through complete exchanges. The [problem formulation](problem.md)
+defines the instance and utility; the [environment](../../envs/emitter.py)
+implements the transitions, and its [code reference](../code/environment.md)
+lists the public interface.
 
-The [problem formulation](problem.md) defines the instance and utility. The
-[environment](../../envs/emitter.py) implements this process, and its [code
-reference](../code/environment.md) lists the public interface.
+There is no fixed task horizon. `max_steps` is an external collection limit
+used to bound one run. The policy does not receive that limit or the remaining
+number of collection slots.
 
 ## A fixed instance and a changing selection
 
-Point positions, weights, demands, contribution matrix $A$, budget $K$, and
-horizon remain fixed during an episode. The environment computes
+Point positions, weights, demands, contribution matrix $A$, and budget $K$
+remain fixed during an episode. The environment computes
 $A_{ij}=\exp(-\lVert x_i-x_j\rVert_2)$ from the supplied coordinates. At
 decision $t$, the selection is $z_t$ and received signal is $r_t=Az_t$.
 
-The dynamic state at decision $t$ is
+The dynamic state is
 
 $$
-s_t=(z_t,h_t,q_t),
+s_t=(z_t,q_t),
 $$
 
-where $h_t$ is the number of decisions left and $q_t$ is active, stopped, or
-timed out. Signal is part of the observation; capped utility and unmet demand
-are diagnostics. The [policy](model.md) receives observations while active.
+where $q_t$ is active, stopped, or succeeded. The selection and
+signal are observations. The [policy](model.md) receives observations while
+active. A timeout belongs to collection bookkeeping rather than the task state.
+The collection counter is kept in `info`, not in the policy observation. Capped
+utility and weighted unmet demand are diagnostics computed from the current
+observation.
 
-The horizon satisfies $T>0$, the exchange cap is $M\geq0$, and $K$ constrains
-every selection.
+The exchange cap is $M\geq0$, and $K$ constrains every selection. The external
+collection limit $T=$`max_steps` is separate from the task state.
 
 ## Initialization
 
-Initialization samples uniformly from the selections containing exactly $K$
+Initialization samples uniformly from selections containing exactly $K$
 emitters:
 
 $$
 z_0\sim\operatorname{Uniform}\left(
-\{z\in\{0,1\}^N:\mathbf 1^\top z=K\}\right),
-\qquad h_0=T,\qquad q_0=\mathrm{active}.
+\{z\in\{0,1\}^N:\mathbf 1^\top z=K\}\right).
 $$
 
-The sample does not depend on demand satisfaction, so unmet demand at the start
-is allowed. For $K=0$ or $K=N$, only one selection exists. Restarting samples
-again from the same fixed instance.
+The sample remains uniform even when it already satisfies demand. The
+environment marks such a row as `succeeded` and freezes it immediately. The
+success test is
+
+$$
+U(z_0)\leq\varepsilon,\qquad \varepsilon=10^{-6},
+$$
+
+where $U$ is weighted unmet demand in raw objective units. The tolerance is a
+numerical success criterion, not an exact mathematical certificate. Receivers
+with zero weight do not affect it, so an instance with zero total weighted
+demand succeeds at reset. The result is reported in `info`; a caller should
+skip the row, and a later `step()` returns `terminated=True` with zero reward.
+
+For $K=0$ or $K=N$, only one selection exists. Restarting samples again from
+the same fixed instance.
 
 ## One continuing action
 
@@ -49,7 +66,8 @@ A continuing action removes $m$ selected emitters and adds $m$ unselected
 points, where
 
 $$
-0\leq m\leq m_{\max},\qquad m_{\max}=\min(M,K,N-K).
+0\leq m\leq m_{\max},\qquad
+m_{\max}=\min(M,K,N-K).
 $$
 
 If $\mathcal R_t$ and $\mathcal C_t$ are the removal and addition sets, valid
@@ -83,60 +101,74 @@ exchange before transitioning.
 
 ## Continuing without edits and stopping
 
-Choosing $m=0$ gives the continuing no-op $a_t=0$: the selection is unchanged,
-but one decision is consumed. It is the only continuing exchange when $M=0$,
-$K=0$, or $K=N$.
+Choosing $m=0$ gives the continuing no-op $a_t=0$. It leaves the selection
+unchanged, consumes one collection slot, and still incurs the search cost. It
+is the only continuing exchange when $M=0$, $K=0$, or $K=N$.
 
-Stopping is separate from continuing and ends the episode with the current
-selection. It has zero exchanges. Demand satisfaction does not stop an active
-episode, which may stop or continue from any demand state. A learned stop does
-not certify optimality.
+Stopping is separate from continuing. It submits a zero exchange, ends the
+episode with the current selection, and receives zero reward. A continuing
+exchange that reaches the numerical success threshold also ends the episode.
+A no-op or a move with no immediate improvement does not establish that the
+selection is optimal.
 
 ## Utility and reward
 
-The environment evaluates $F(z)$ and reports $U(z)$ from the [problem
-document](problem.md#capped-utility-and-unmet-demand), but reward uses only the
-utility difference:
+The environment reports $F(z)$ and $U(z)$ from the [problem
+document](problem.md#capped-utility-and-unmet-demand). For an active row, the
+reward is
 
 $$
-R_t=F(z_{t+1})-F(z_t).
+R_t=\begin{cases}
+0,&\text{if the policy stops},\\
+F(z_{t+1})-F(z_t)-c,&\text{if the policy continues},
+\end{cases}
+\qquad c>0.
 $$
 
-Stops and no-ops receive zero reward. A worsening exchange receives negative
-reward, including when it is the final decision.
+The cost $c$ is `config.step_cost`, a positive finite value in the same units
+as $F$. It applies to every continuation, including a no-op and an exchange
+that reaches success or the collection limit. Calls on frozen rows return
+zero reward.
 
 ## Decision budget and completion
 
-Every active decision, including a stop or no-op, consumes one unit:
+Each active call to `step()` consumes one external collection slot. The internal
+counter is returned as `info["steps_remaining"]`; it is not part of the policy
+observation.
+
+A stop sets the completion reason to `stopped`. A successful continuing action
+sets it to `succeeded`. If a continuing action reaches the external limit
+without either condition, the reason is `timed_out`. The environment returns
 
 $$
-h_{t+1}=h_t-1.
+\texttt{terminated}=\texttt{stopped}\lor\texttt{succeeded},\qquad
+\texttt{truncated}=\texttt{timed\_out}.
 $$
 
-A stop sets the completion reason to stopped. A continuing action using the last
-decision sets it to timed out; a stop on the last decision takes precedence.
-Both reasons end the episode. The horizon is part of the task, with no separate
-external cutoff. After completion, the state stays fixed until initialization;
-further calls return zero reward and keep the completion reason.
+Stop or success takes precedence when it occurs on the last collection slot.
+Completed rows keep their final selection and observation until reset. A
+masked reset restarts only the requested rows and returns the full batch; call
+`reset(mask=terminated | truncated)` after saving the final observations.
 
-A timeout may leave unmet demand. The environment keeps the final selection
-rather than restoring an earlier one, so final utility reports the search
-outcome and does not establish optimality.
+An actor-critic collector resets on `terminated | truncated`. It suppresses the
+bootstrap term for a terminated transition. For a truncated transition, it
+bootstraps from the final observation returned before reset. Return calculations
+must not cross a reset boundary into the next episode.
 
 ## Return over an episode
 
-For undiscounted rewards and an episode ending after
-$t_{\mathrm{end}}\leq T$ decisions,
+For an episode that reaches stop or numerical success after $L$ continuing
+actions, the undiscounted return is
 
 $$
 \begin{aligned}
-\sum_{t=0}^{t_{\mathrm{end}}-1}R_t
-&=\sum_{t=0}^{t_{\mathrm{end}}-1}
-\left[F(z_{t+1})-F(z_t)\right]\\
-&=F(z_{t_{\mathrm{end}}})-F(z_0).
+\sum_t R_t
+&=\sum_t\left[F(z_{t+1})-F(z_t)\right]-cL\\
+&=F(z_{\mathrm{final}})-F(z_0)-cL.
 \end{aligned}
 $$
 
-For a fixed initial selection, maximizing return is the same as maximizing final
-utility. There is no computation-cost reward for stopping early. The proposed
-policy uses $\gamma=1$.
+The planned first trainer uses $\gamma=1$. The fixed per-decision cost gives
+the policy a reason to stop searching, but it is a proxy for search effort, not
+a measurement of runtime. Larger exchanges use more internal point choices, so
+evaluation must measure computational cost separately.
