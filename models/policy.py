@@ -11,25 +11,14 @@ from models.transformer_encoder import TransformerEncoder
 
 
 class EmitterPolicy(nn.Module):
-    """Construct complete emitter actions and score their ordered traces.
+    """Compose the encoder, decision heads, and pointer decoder into emitter actions.
 
-    The caller controls valid inputs, matching widths, dtype and device
-    placement, random seeds, and completed rows. Methods preserve inputs and
-    autograd; the caller steps or resets the environment.
+    The caller controls input validity, seeds, completed rows, and environment
+    stepping; methods preserve inputs and autograd.
     """
 
     def __init__(self, *, encoder: TransformerEncoder, heads: PolicyHeads, decoder: PointerDecoder) -> None:
-        """Register the caller-owned policy modules.
-
-        Args:
-            encoder: Module that maps an observation to point and global
-                embeddings.
-            heads: Module that produces stop, count, and value outputs.
-            decoder: Module that chooses ordered removals and additions.
-
-        Raises:
-            ValueError: If the heads and decoder use different exchange caps.
-        """
+        """Register caller-owned modules and require matching exchange caps."""
         super().__init__()
         if heads.max_exchanges != decoder.max_exchanges:
             raise ValueError("heads and decoder must share max_exchanges")
@@ -40,20 +29,15 @@ class EmitterPolicy(nn.Module):
     def forward(
         self, observation: dict[str, Tensor], *, greedy: bool = False
     ) -> tuple[dict[str, Tensor], dict[str, Tensor], Float[Tensor, "B"], Float[Tensor, "B"]]:
-        """Construct an action and return its trace log probability and value.
+        """Build an action, ordered trace, log probability, and value.
 
-        Args:
-            observation: Batched emitter observation accepted by the encoder.
-            greedy: If true, take argmax decisions. Selected decisions are
-                still scored under their categorical distributions.
-
-        Returns:
-            A tuple ``(action, trace, log_prob, value)``. ``action`` contains
-            int64 signed ``exchanges`` ``[B,N]`` and Boolean ``stop`` ``[B]``.
-            ``trace`` contains Boolean ``stop`` ``[B]``, int64 ``counts``
-            ``[B]``, and int64 ``removals``/``additions`` ``[B,M]`` with
-            zero-based valid prefixes and ``-1`` padding. ``log_prob`` and
-            ``value`` are both ``[B]``.
+        Return ``(action, trace, log_prob, value)``. ``action`` contains int64
+        signed ``exchanges`` ``[B,N]`` and Boolean ``stop`` ``[B]``; ``trace``
+        contains ``stop`` ``[B]``, ``counts`` ``[B]``, and ordered
+        ``removals``/``additions`` ``[B,M]`` with valid zero-based prefixes
+        followed by ``-1`` padding. ``log_prob`` and ``value`` have shape
+        ``[B]``. Greedy decoding uses argmax choices while still scoring them
+        under their categorical distributions.
         """
         point_embeddings, global_embedding = self.encoder(observation)
         selected: Bool[Tensor, "B N"] = observation["selected"]
@@ -98,16 +82,11 @@ class EmitterPolicy(nn.Module):
     def evaluate(
         self, observation: dict[str, Tensor], trace: dict[str, Tensor]
     ) -> tuple[Float[Tensor, "B"], Float[Tensor, "B"]]:
-        """Score a supplied ordered trace under the current policy.
+        """Score a supplied ordered trace without sampling.
 
-        Args:
-            observation: Batched emitter observation accepted by the encoder.
-            trace: Trace with ``stop``, ``counts``, ``removals``, and
-                ``additions`` fields matching :meth:`forward`.
-
-        Returns:
-            A tuple ``(log_prob, value)`` of batched tensors. The supplied
-            point order is scored without sampling.
+        Return ``(log_prob, value)`` with each tensor shaped ``[B]``. The trace
+        follows :meth:`forward`'s format, and the supplied point-choice order is
+        scored without sampling.
         """
         point_embeddings, global_embedding = self.encoder(observation)
         selected: Bool[Tensor, "B N"] = observation["selected"]

@@ -20,35 +20,17 @@ class EncoderConfig:
 
 
 def load_config(path: str | Path) -> EncoderConfig:
-    """Read the encoder section from an explicit YAML path.
-
-    Args:
-        path: YAML file containing an ``encoder`` mapping with the four
-            required :class:`EncoderConfig` fields.
-
-    Returns:
-        The encoder architecture configuration.
-    """
+    """Load the four required encoder fields from the ``encoder`` YAML mapping."""
     with Path(path).open(encoding="utf-8") as stream:
         values = yaml.safe_load(stream)
     return EncoderConfig(**values["encoder"])
 
 
 class TransformerEncoder(nn.Module):
-    """Encode point tokens and a global observation summary.
-
-    The point feature width is ``D+4``: ``D`` coordinates followed by weight,
-    selection, received signal, and demand margin.  The pooled point
-    representation is projected into the global embedding.
-    """
+    """Encode coordinates, point scalars, and demand margin into point and global embeddings."""
 
     def __init__(self, *, config: EncoderConfig, coordinate_dim: int) -> None:
-        """Construct an encoder from the caller-owned architecture settings.
-
-        Args:
-            config: Representation width ``d`` and transformer layer dimensions.
-            coordinate_dim: Coordinate width ``D`` in each point token.
-        """
+        """Build the encoder from caller-owned architecture settings."""
         super().__init__()
         self.config = config
         self.coordinate_dim = coordinate_dim
@@ -76,18 +58,11 @@ class TransformerEncoder(nn.Module):
         )
 
     def forward(self, observation: dict[str, Tensor]) -> tuple[Float[Tensor, "B N d"], Float[Tensor, "B d"]]:
-        """Encode point observations and their global summary.
+        """Encode point observations into per-point ``H`` and global ``g`` embeddings.
 
-        Args:
-            observation: Mapping containing ``points`` ``[B,N,D]``, ``weights``
-                ``[B,N]``, Boolean ``selected`` ``[B,N]``,
-                ``received_signal`` ``[B,N]``, float ``demands`` ``[B,N]``,
-                and optional additional fields.  Contribution and timer fields
-                are ignored.
-
-        Returns:
-            A tuple ``(H, g)``.  ``H`` has one contextual embedding of width
-            ``d`` for every point, and ``g`` is a width-``d`` global embedding.
+        Use ``points``, ``weights``, ``selected``, ``received_signal``, and
+        ``demands``; contribution and timer fields are ignored. Return
+        ``(H, g)`` with shapes ``[B,N,d]`` and ``[B,d]``.
         """
         points: Float[Tensor, "B N D"] = observation["points"]
         weights: Float[Tensor, "B N"] = observation["weights"]

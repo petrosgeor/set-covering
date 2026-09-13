@@ -33,14 +33,7 @@ class EnvConfig:
 
 
 def load_config(path: str | Path) -> EnvConfig:
-    """Read a flat, explicit YAML configuration without executable loading.
-
-    Args:
-        path: YAML file containing exactly the six EnvConfig fields.
-
-    Returns:
-        Shared configuration, with no implicit field defaults.
-    """
+    """Load the six required ``EnvConfig`` fields from a flat YAML mapping without executable loading."""
     with Path(path).open(encoding="utf-8") as stream:
         values = yaml.safe_load(stream)
     return EnvConfig(**values)
@@ -58,14 +51,7 @@ class BatchedEmitterEnv:
         *,
         demands: Float[Tensor, "B N"],
     ) -> None:
-        """Own an instance with contributions exp(-distance); reset starts an episode.
-
-        Args:
-            points: Finite float32/float64 coordinates with positive B, N, D.
-            weights: Matching-dtype finite, nonnegative receiver weights.
-            config: Shared budgets and destination CPU/CUDA device.
-            demands: Matching-dtype finite, nonnegative receiver demand caps.
-        """
+        """Clone points, weights, and demand caps onto the configured device; call ``reset()`` before stepping."""
         self.config = config
         self._points = points.detach().to(config.device).clone()
         self._weights = weights.detach().to(config.device).clone()
@@ -79,19 +65,13 @@ class BatchedEmitterEnv:
     def reset(
         self, *, seed: int | None = None, mask: Bool[Tensor, "B"] | None = None
     ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-        """Restart selected rows and return the full batch.
+        """Reset all rows or rows selected by ``mask`` and return full-batch observation and info.
 
-        Args:
-            seed: Optional override restarting the shared local random stream
-                when at least one row resets. Otherwise the stream advances.
-            mask: Boolean [B] on the configured device; true rows get a uniform
-                K-subset and fresh counters. None resets all rows. Initialize
-                with a full reset before using masks. An empty mask is a no-op.
-
-        Returns:
-            Full observation and info dictionaries, including unchanged rows.
-            Rows with weighted unmet demand at most 1e-6 are already complete;
-            exclude rows marked ``info["succeeded"]`` from action collection.
+        Use a full reset before masked resets; an empty mask is a no-op. The mask
+        must be Boolean with shape ``[B]`` on the configured device. A provided
+        seed resets the shared RNG when any row resets. Reset rows receive a
+        fresh uniform K-subset and step budget. Rows with weighted unmet demand
+        at most ``1e-6`` are marked succeeded and should not receive actions.
         """
         batch_size, num_points = self._points.shape[:2]
         if mask is None:
@@ -131,18 +111,15 @@ class BatchedEmitterEnv:
     def step(
         self, action: dict[str, Tensor]
     ) -> tuple[dict[str, Tensor], Float[Tensor, "B"], Bool[Tensor, "B"], Bool[Tensor, "B"], dict[str, Tensor]]:
-        """Apply simultaneous exchanges and reward the change in objective.
+        """Apply a simultaneous valid exchange and return the next transition tuple.
 
-        Args:
-            action: Dictionary with signed ternary "exchanges" [B,N] and Boolean
-                "stop" [B], on the configured device. Exchanges add unselected
-                points and remove selected ones in equal counts up to the cap.
-                Stops on active rows carry zero edits. Finished rows freeze.
-
-        Returns:
-            Observation, reward, terminated, truncated, and info. Explicit stops
-            and weighted unmet demand at most 1e-6 terminate a row. The external
-            step limit truncates an active row unless it stops or succeeds.
+        ``action`` contains signed ternary ``exchanges`` ``[B,N]`` and Boolean
+        ``stop`` ``[B]``. Continuing rows exchange equal numbers of selected and
+        unselected points up to the cap; stopping rows have zero edits, and
+        finished rows freeze. Return ``(observation, reward, terminated,
+        truncated, info)``. Explicit stops and successful continuations
+        terminate before timeout; only continuing, unsuccessful rows at the
+        step limit truncate.
         """
         observation = self._get_observation()
         exchanges, stop = action["exchanges"], action["stop"]

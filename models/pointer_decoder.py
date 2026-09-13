@@ -12,12 +12,7 @@ class PointerDecoder(nn.Module):
     """Decode point choices conditional on an already-chosen exchange count."""
 
     def __init__(self, *, model_dim: int, max_exchanges: int) -> None:
-        """Build the embeddings, pointer projections, and recurrent memory.
-
-        Args:
-            model_dim: Positive width d shared by representations and memory.
-            max_exchanges: Nonnegative maximum pair count M.
-        """
+        """Initialize count and phase embeddings, pointer projections, and recurrent memory."""
         super().__init__()
         self.max_exchanges = max_exchanges
         self.count_embedding = nn.Embedding(max_exchanges + 1, model_dim)   # this is max exhanges + 1 because we can have zero exchanges
@@ -42,28 +37,15 @@ class PointerDecoder(nn.Module):
         counts: Int[Tensor, "B"],
         greedy: bool = False,
     ) -> tuple[Int[Tensor, "B M"], Int[Tensor, "B M"], Float[Tensor, "B"]]:
-        """Generate an ordered trace and its conditional log probability.
+        """Generate an ordered removal/addition trace and its point-choice log probability.
 
-        Args:
-            H: Point embeddings with positive B and N, matching the model's
-                floating dtype and device. They stay fixed during decoding.
-            g: Global embeddings for the same batch, dtype, and device.
-            selected: Boolean original selection on H's device.
-            counts: int64 pair counts on H's device, between zero and
-                min(M, K, N-K), where K is each row's selected count.
-            greedy: Choose the highest-logit point instead of sampling. Ties
-                choose the lowest eligible index. Sampling uses PyTorch's RNG.
-
-        Returns:
-            Removals [B,M], additions [B,M], and log probabilities [B]. Each
-            index tensor has counts[b] valid ordered entries followed by -1.
-            M=0 gives [B,0] index tensors. Zero counts give zero log probability.
-            Probabilities cover only point choices, including in greedy mode;
-            stop and count decisions are excluded.
-
-        The caller controls seeds and placement and supplies valid inputs.
-        Inputs are not validated or modified. Log probabilities retain autograd
-        connections to the encoder; chosen integer indices are not differentiable.
+        Return ``(removals, additions, log_prob)``: ``[B,M]`` index tensors with
+        valid ordered prefixes of length ``counts[b]`` and ``-1`` padding, plus
+        ``[B]`` log probabilities. Removals are decoded before additions; only
+        point choices contribute, and zero-count rows have zero log probability.
+        Greedy decoding picks the lowest eligible index on ties. The caller
+        supplies valid inputs, which remain unchanged, and the log probabilities
+        stay connected to the encoder.
         """
         return self._decode(H, g, selected, counts, greedy=greedy, choices=None)
 
@@ -77,22 +59,13 @@ class PointerDecoder(nn.Module):
         removals: Int[Tensor, "B M"],
         additions: Int[Tensor, "B M"],
     ) -> Float[Tensor, "B"]:
-        """Score supplied point choices without sampling or consuming randomness.
+        """Score supplied ordered point choices without sampling or consuming RNG.
 
-        Args:
-            H: Fixed point embeddings, following forward's input contract.
-            g: Matching global embeddings.
-            selected: Boolean original selection.
-            counts: Legal int64 pair counts for each row.
-            removals: int64 indices of originally selected points, on H's device.
-                The first counts[b] entries must be valid and distinct per row.
-            additions: int64 indices of originally unselected points with the
-                same shape and prefix rules as removals. Trailing padding in
-                either tensor is ignored.
-
-        Returns:
-            Conditional log probabilities [B] for the supplied order, with zero
-            for empty traces. Inputs are trusted, unchanged, and not detached.
+        Return ``[B]`` conditional point-choice log probabilities, with zero for
+        empty traces. The first ``counts[b]`` entries of each tensor must be
+        valid distinct choices from the original selected or unselected sets;
+        trailing padding is ignored. Inputs are unchanged, and floating inputs
+        remain attached to autograd.
         """
         _, _, log_prob = self._decode(H, g, selected, counts, greedy=False, choices=(removals, additions))
         return log_prob
