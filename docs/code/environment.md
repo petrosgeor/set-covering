@@ -3,8 +3,8 @@
 [`BatchedEmitterEnv`](../../envs/emitter.py) runs independent emitter-exchange
 episodes.
 
-Construct `BatchedEmitterEnv(points, weights, decay, config, *, demands)`.
-`decay` is nonincreasing, and tensors share a float dtype.
+Construct `BatchedEmitterEnv(points, weights, config, *, demands)` with a shared
+float dtype.
 `load_config(path)` reads the five required fields from
 [`environment.yaml`](../../parameters/environment.yaml): `num_emitters`,
 `max_exchanges`, `max_steps`, `seed`, and `device`.
@@ -21,10 +21,11 @@ Construct `BatchedEmitterEnv(points, weights, decay, config, *, demands)`.
 | `selected` | `[B,N]` | Boolean |
 | `steps_remaining` | `[B]` | int64 |
 
-Fixed instance tensors are borrowed, read-only; dynamic observations are
-snapshots. Construction detaches, moves, and clones instance tensors.
-`received_signal` is the raw product `Az`. `decay` preserves input shape, dtype,
-and device.
+Construction detaches, moves, and clones instance tensors. Observations borrow
+these fixed tensors as read-only data and snapshot dynamic state.
+`received_signal` is the raw product `Az`. Contributions use
+`exp(-||x_i-x_j||_2)` with unit diagonal. Coordinates are used unchanged,
+without normalization or a scale parameter.
 
 ## Usage
 
@@ -38,7 +39,6 @@ demands = torch.tensor([[1.0, 1.25, 0.75, 1.0]], dtype=points.dtype)
 env = BatchedEmitterEnv(
     points,
     torch.ones(1, 4, dtype=points.dtype),
-    lambda d: (1 - d).clamp_min(0),
     config,
     demands=demands,
 )

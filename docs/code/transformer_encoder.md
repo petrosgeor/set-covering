@@ -3,15 +3,14 @@
 [`TransformerEncoder`](../../models/transformer_encoder.py) maps an
 [environment observation](environment.md) to point embeddings `H [B,N,d]`
 and a global embedding `g [B,d]`. Here `B` counts episodes, `N` points,
-and `d` is the embedding width. The policy heads and pointer decoder are
-separate implemented modules; complete policy assembly and PPO training remain
-unimplemented.
+and `d` is the embedding width. The [complete policy](policy.md) adds decision
+heads and a pointer decoder. PPO training is unimplemented.
 
 ## Configuration and computation
 
 `load_config(path)` reads the `encoder` section of
 [`transformer_gru.yaml`](../../parameters/transformer_gru.yaml) into `EncoderConfig`.
-All four fields are required, without defaults: `model_dim` (embedding width),
+The four required fields have no defaults: `model_dim` (embedding width),
 `num_layers` (depth), `num_heads` (attention heads), and `feedforward_dim`
 (feed-forward hidden width).
 
@@ -34,7 +33,7 @@ floating-point tolerance.
 
 ## Usage
 
-Continue from the environment example, using its `config` and `observation`:
+Use `config` and `observation` from the environment example:
 
 ```python
 from models.transformer_encoder import TransformerEncoder, load_config

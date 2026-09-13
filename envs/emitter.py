@@ -3,7 +3,6 @@
 Each batch row is independent.
 """
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,19 +45,15 @@ class BatchedEmitterEnv:
         self,
         points: Float[Tensor, "B N D"],
         weights: Float[Tensor, "B N"],
-        decay: Callable[[Float[Tensor, "B N N"]], Float[Tensor, "B N N"]],
         config: EnvConfig,
         *,
         demands: Float[Tensor, "B N"],
     ) -> None:
-        """Own an instance and prepare contributions; reset starts an episode.
+        """Own an instance with contributions exp(-distance); reset starts an episode.
 
         Args:
             points: Finite float32/float64 coordinates with positive B, N, D.
             weights: Matching-dtype finite, nonnegative receiver weights.
-            decay: Deterministic elementwise nonnegative, nonincreasing decay,
-                finite at zero. Return the same shape, dtype, and device as
-                its distances input.
             config: Shared budgets and destination CPU/CUDA device.
             demands: Matching-dtype finite, nonnegative receiver demand caps.
         """
@@ -67,7 +62,7 @@ class BatchedEmitterEnv:
         self._weights = weights.detach().to(config.device).clone()
         self._demands = demands.detach().to(config.device).clone()
         self._device = self._points.device
-        self._contributions = self._build_contributions(decay)
+        self._contributions = self._build_contributions()
         self._generator = torch.Generator(device=self._device)
         self._generator.manual_seed(config.seed)
 
@@ -171,7 +166,7 @@ class BatchedEmitterEnv:
             self._get_info(next_observation),
         )
 
-    def _build_contributions(self, decay: Callable) -> Float[Tensor, "B N N"]:
+    def _build_contributions(self) -> Float[Tensor, "B N N"]:
         distances = torch.cdist(
             self._points,
             self._points,
@@ -179,7 +174,7 @@ class BatchedEmitterEnv:
             compute_mode="donot_use_mm_for_euclid_dist",
         )
         distances.diagonal(dim1=-2, dim2=-1).zero_()
-        return decay(distances).detach().clone()
+        return torch.exp(-distances)
 
     def _evaluate_observation(
         self, observation: dict[str, Tensor]

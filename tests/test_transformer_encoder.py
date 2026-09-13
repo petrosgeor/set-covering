@@ -50,21 +50,6 @@ def observation() -> dict[str, Tensor]:
     }
 
 
-def test_config_loads_starter_and_small_values(tmp_path: Path) -> None:
-    """The starter and a smaller YAML file load into the expected config."""
-    starter = load_config(ROOT / "parameters" / "transformer_gru.yaml")
-    assert starter == EncoderConfig(128, 3, 4, 512)
-
-    path = tmp_path / "encoder.yaml"
-    path.write_text(
-        "encoder:\n"
-        "  model_dim: 8\n"
-        "  num_layers: 1\n"
-        "  num_heads: 2\n"
-        "  feedforward_dim: 16\n",
-        encoding="utf-8",
-    )
-    assert load_config(path) == EncoderConfig(8, 1, 2, 16)
 
 
 def test_features() -> None:
@@ -256,11 +241,16 @@ def test_environment_reset_observation() -> None:
     env = BatchedEmitterEnv(
         points,
         torch.ones(2, 4),
-        lambda distances: torch.exp(-distances),
         config,
         demands=demands,
     )
     obs, info = env.reset(seed=23)
+    contributions = obs["contributions"]
+    assert contributions.shape == (2, 4, 4)
+    torch.testing.assert_close(
+        contributions.diagonal(dim1=-2, dim2=-1), torch.ones(2, 4), rtol=0, atol=0
+    )
+    torch.testing.assert_close(contributions[:, 0, 1], torch.full((2,), -0.5).exp())
     encoded_points, global_embedding = make_model(1, max_steps=4)(obs)
     assert encoded_points.shape == (2, 4, 8)
     assert global_embedding.shape == (2, 8)

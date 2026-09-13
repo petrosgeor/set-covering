@@ -1,116 +1,57 @@
 # A transformer and pointer policy for emitter exchanges
 
-The implemented encoder, policy heads, and pointer decoder provide the model
-components for one emitter exchange. A complete policy assembly would choose
-whether to stop, choose an exchange count, and construct one action.
+The [complete policy](../code/policy.md) combines an encoder, policy heads,
+and pointer decoder. It chooses stop or continue, chooses an exchange count,
+and constructs one environment action with its ordered trace. The
+[encoder implementation](../code/transformer_encoder.md), [policy heads](../../models/policy_heads.py),
+and [pointer decoder](../../models/pointer_decoder.py) are separate modules;
+the complete policy assembles them and evaluates supplied traces. PPO training
+remains unimplemented. Model and feed-forward widths, encoder depth, and
+attention head count are configuration parameters. The [problem](problem.md) and
+[environment](environment.md) define the task and transition semantics.
 
-The [encoder implementation](../code/transformer_encoder.md) produces the point
-and global representations described in sections 1-4. The
-[policy heads](../../models/policy_heads.py) and
-[pointer decoder](../../models/pointer_decoder.py) are implemented separately.
-Complete composition, action adaptation, and PPO training remain proposed.
-Model widths, encoder depth, and attention-head count remain parameters.
-The [problem](problem.md) and [environment](environment.md) define what the
-policy is trying to solve and how its actions change the selection.
-
-The walkthrough follows one instance at one decision. We introduce each
-component when its input is ready, then connect the complete action to training.
-During action construction, the environment state stays fixed.
+During one action, the observation stays fixed while the decoder constructs
+the exchange. The environment changes the selection only after construction
+is complete.
 
 ## The path through one decision
 
-The policy first describes every point, then lets those descriptions interact.
-A summary of the configuration supports the stop and exchange-count decisions.
-If an exchange is needed, a pointer decoder selects the participating points.
-
 ```text
-Point features [N,D+4]
-          |
-          v
-Shared input projection [N,d]
-          |
-          v
-Transformer encoder
-          |
-          v
-Point representations H [N,d] ---------------------+
-          |                                        |
-          v                                        |
-Mean pooling [d]                                   |
-          |                                        |
-Add remaining budget fraction                       |
-          |                                        |
-          v                                        |
-Global representation g [d]                        |
-          |                                        |
-          +--> Value estimate (used for training)   |
-          |                                        |
-          v                                        |
-    Stop or continue                               |
-     /          \                                  |
-   stop       continue                             |
-    |            |                                 |
-    |       Choose count m                         |
-    |        /         \                           |
-    |      m=0         m>0                         |
-    |       |           |                          |
-    |       |           +--> Pointer decoder <-----+
-    |       |                      |
-    |       |           m removals, then m additions
-    |       |                      |
-    v       v                      v
-  Stop    No-op              Complete exchange
-    \       |                      /
-     +------+---------------------+
-            |
-            v
-    One environment transition
+Observation
+    -> point features [B,N,D+4] -> shared projection
+    -> transformer -> point representations H [B,N,d]
+    -> mean(H) + remaining fraction h/T -> global representation g [B,d]
+g -> value estimate
+g -> stop -> zero exchange and episode termination
+  continue -> count m -> no-op when m=0, otherwise GRU pointer
+                         -> m removals, then m additions
+                         -> one signed exchange and environment transition
 ```
 
-Here $N$ counts points, $D$ is the coordinate dimension, and $d$ is the learned
-representation width. Each matrix row represents one point. The detailed
-walkthrough begins with the numbers supplied to that row.
+Here $N$ is the number of points, $D$ the coordinate dimension, $d$ the
+representation width, and $B$ the batch size.
 
 ## 1. Describe each point
 
-At the current decision, point $i$ has coordinates $x_i$, receiver weight $w_i$,
-selection indicator $z_i$, received signal $r_i$, and demand $u_i$. The encoder
-uses $u_i$ only to form the signed margin in its feature vector:
+At the current decision, point $i$ has coordinates $x_i$, receiver weight
+$w_i$, selection indicator $z_i$, received signal $r_i$, and demand $u_i$.
+The indicator is encoded as zero or one, and demand enters through the signed
+margin in
 
 $$
 v_i=\left[x_{i,:},w_i,z_i,r_i,r_i-u_i\right]
 \in\mathbb R^{D+4}.
 $$
 
-Coordinates contribute $D$ numbers; the other four entries are scalars.
-The selection indicator is represented numerically as zero or one.
-The final entry is the signed demand margin. A negative value identifies unmet
-demand, zero reaches the cap, and a positive value records signal above the cap.
-
-Use the [running instance](problem.md#signal-from-the-selected-emitters) with
-selection $(1,1,0,0)^\top$. Its point features are:
-
-| Point $i$ | Position | Weight | Selected | Signal | Source demand | Derived margin |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1 | $0$ | $1$ | $1$ | $1.5$ | $1$ | $0.5$ |
-| 2 | $0.5$ | $1$ | $1$ | $1.5$ | $1.25$ | $0.25$ |
-| 3 | $1$ | $1$ | $0$ | $0.5$ | $0.75$ | $-0.25$ |
-| 4 | $1.5$ | $1$ | $0$ | $0$ | $1$ | $-1$ |
-
-For example, $v_4=[1.5,1,0,0,-1]$ has five entries because this instance
-has $D=1$. The demand column above is source context, not an extra input entry.
-Stacking the five-entry vectors produces an $N\times(D+4)$ input matrix.
-The environment has already calculated the signal before the policy receives it.
-
-The baseline assumes a fixed, known decay law for a run. These features include
-coordinates and current signal, but there is no separate learned input for the
-contribution matrix $A$. An independently varying decay law would require a
-separate decision about how the model identifies it.
+The margin is negative below demand, zero at the cap, and positive above it.
+The environment computes $r_i$ before the policy receives the observation.
+The model receives coordinates and current signal, not the contribution matrix
+$A$; the fixed law is
+$A_{ij}=\exp(-\lVert x_i-x_j\rVert_2)$.
 
 ## 2. Embed each point with a shared projection
 
-A learned projection turns each feature vector into a representation of width
-$d$:
+Each feature vector passes through the same two-layer projection:
 
 $$
 e_i=\phi_{\mathrm{in}}(v_i)\in\mathbb R^d,
@@ -118,127 +59,51 @@ e_i=\phi_{\mathrm{in}}(v_i)\in\mathbb R^d,
 \phi_{\mathrm{in}}:\mathbb R^{D+4}\to\mathbb R^d.
 $$
 
-The same parameters are used for every point. There is no separate input
-network for point 1 or point 2. The input projection uses two affine layers,
-with widths $D+4\to d\to d$ and a GELU activation between them.
-
-```text
-v_1 [D+4] --> shared projection --> e_1 [d]
-v_2 [D+4] --> shared projection --> e_2 [d]
-    ...                                ...
-v_N [D+4] --> shared projection --> e_N [d]
-```
-
-Stack the embeddings as rows of $E\in\mathbb R^{N\times d}$. At this stage,
-$e_i$ depends only on the supplied $v_i$. The signal feature already summarizes
-a physical effect of the emitters, but the projection itself has not compared
-point tokens. The transformer introduces that interaction next.
+The affine widths are $D+4\to d\to d$, with GELU between them. Stacking the
+embeddings gives $E\in\mathbb R^{N\times d}$. Before attention, $e_i$ depends
+only on point $i$'s features.
 
 ## 3. Let the point representations interact
 
-The transformer maps the embeddings to contextualized point representations:
+The transformer produces contextualized point representations:
 
 $$
 H=\operatorname{TransformerEncoder}_\theta(E)
 \in\mathbb R^{N\times d}.
 $$
 
-The output still has one row per point. Each row can now depend on the other
-points. To see how this happens, consider one attention head in the first layer.
-From $E$, learned projections form queries, keys, and values:
-
-$$
-Q^{\mathrm{attn}}=EW_Q^{\mathrm{attn}},\qquad
-K^{\mathrm{attn}}=EW_K^{\mathrm{attn}},\qquad
-V^{\mathrm{attn}}=EW_V^{\mathrm{attn}}.
-$$
-
-Let the query and key width be $d_a$, and the value width be $d_v$.
-The projection matrices have dimensions $d\times d_a$, $d\times d_a$, and
-$d\times d_v$, respectively. The superscript distinguishes the attention keys
-$K^{\mathrm{attn}}$ from the emitter budget $K$.
-
-For receiver token $i$, compare its query to every token's key:
-
-$$
-s_{ij}=\frac{\langle Q^{\mathrm{attn}}_{i,:},K^{\mathrm{attn}}_{j,:}\rangle}
-{\sqrt{d_a}},
-\qquad
-\alpha_{ij}=\frac{\exp(s_{ij})}{\sum_{j'=1}^N\exp(s_{ij'})}.
-$$
-
-The weights $\alpha_{ij}$ sum to one over $j$. They determine the mixture of
-value vectors received by token $i$:
-
-$$
-\widetilde e_i=\sum_{j=1}^N\alpha_{ij}V^{\mathrm{attn}}_{j,:}
-\in\mathbb R^{d_v}.
-$$
-
-```text
-Point i's query
-       |
-Compare with every point's key
-       |
-Attention weights over the N points
-       |
-Weighted mixture of their value vectors
-```
-
-For point 4, whose demand margin is negative, this mechanism allows its representation to use
-information about selected emitters and possible alternatives. Which information
-it uses is learned. The attention weights combine information; the policy's
-later pointer distributions select points for an exchange.
-
-Each encoder layer combines multiple heads and includes residual connections,
-normalization, and a pointwise feed-forward network. The encoder depth
-$L_{\mathrm{enc}}$ and head count $h_{\mathrm{enc}}$ remain symbolic parameters.
-The implementation uses pre-normalization, GELU in the feed-forward network,
-and zero dropout. Each layer is initialized independently. A final layer
-normalization after the stack produces $H$, with representation width $d$.
-The per-head widths in this implementation satisfy $d_a=d_v=d/h_{\mathrm{enc}}$.
-
-Attention is full: each point can attend to every point, including itself.
-There is no causal mask or positional encoding based on arbitrary point index.
-Coordinates carry the spatial information. With shared point operations,
-reordering the points reorders their representations correspondingly. Mean
-pooling in the next component gives a summary independent of that ordering.
+Each row can depend on every point, including itself. Layers use full
+self-attention, residual connections, pre-normalization, a GELU feed-forward
+network, and zero dropout. Each layer is initialized independently, and a
+final layer normalization produces $H$. There is no causal mask or positional
+encoding tied to arbitrary point index; coordinates carry spatial information.
+Reordering points reorders $H$ and leaves the pooled global representation
+unchanged up to floating-point effects. The implementation uses
+$d_a=d_v=d/h_{\mathrm{enc}}$ for each attention head.
 
 ## 4. Summarize the current configuration
 
-Mean pooling averages the contextualized point representations:
+Mean pooling gives
 
 $$
 \bar h=\frac1N\sum_{i=1}^N H_{i,:}\in\mathbb R^d.
 $$
 
-The policy retains $H$ for the pointer decoder. The pooled vector supplies a
-compact summary for decisions about the whole action.
-
-The remaining budget also affects the decision. Let $h$ be the number of
-decisions remaining and $T$ the episode horizon. A learned projection combines
-the fraction $h/T$ with the pooled vector:
+The policy retains $H$ for the pointer decoder and combines $\bar h$ with the
+remaining decision fraction $h/T$:
 
 $$
 g=\psi\left([\bar h,h/T]\right)\in\mathbb R^d,
 \qquad \psi:\mathbb R^{d+1}\to\mathbb R^d.
 $$
 
-```text
-Mean point representation [d] ---+
-Remaining budget fraction h/T --+--> concatenate [d+1] --> psi --> g [d]
-```
-
-The global projection uses two affine layers, with widths $d+1\to d\to d$
-and a GELU activation between them.
-
-The fraction $h/T$ tells the policy how much opportunity remains to change the
-selection. The signed point margins carry demand information into $H$.
-We now have the global representation needed for the stop and count heads.
+The global projection has widths $d+1\to d\to d$ with GELU between layers.
+The heads therefore receive a summary of the configuration and remaining
+decision budget.
 
 ## 5. Decide whether to stop
 
-The stop head produces two raw logits, one for continue and one for stop:
+The stop head produces logits for continue and stop:
 
 $$
 \lambda^{\mathrm{stop}}=gW_{\mathrm{stop}}+\beta_{\mathrm{stop}}
@@ -246,25 +111,16 @@ $$
 \qquad W_{\mathrm{stop}}\in\mathbb R^{d\times2}.
 $$
 
-A logit is an unnormalized score. Softmax converts the two scores into a
-categorical distribution:
-
-$$
-P(\mathrm{stop}\mid o)=
-\frac{\exp(\lambda^{\mathrm{stop}}_1)}
-{\exp(\lambda^{\mathrm{stop}}_0)+\exp(\lambda^{\mathrm{stop}}_1)}.
-$$
-
-Continue and stop remain available for every demand state. A sampled stop emits
-a zero exchange and ends action construction; the count and point choices are
-skipped.
-The [environment](environment.md#continuing-without-edits-and-stopping) defines
-the resulting episode termination.
+The policy samples from the categorical distribution defined by these logits.
+Both choices remain available in every demand state. Stop emits a zero
+exchange and ends action construction; the count and point choices are
+skipped. The [environment](environment.md#continuing-without-edits-and-stopping)
+determines the completion reason.
 
 ## 6. Choose how many pairs to exchange
 
-On the continue branch, a separate head produces a logit for each count
-$0,1,\ldots,M$:
+On the continue branch, the count head produces one logit for each
+$m\in\{0,\ldots,M\}$:
 
 $$
 \lambda^{\mathrm{count}}=gW_{\mathrm{count}}+\beta_{\mathrm{count}}
@@ -272,164 +128,54 @@ $$
 \qquad W_{\mathrm{count}}\in\mathbb R^{d\times(M+1)}.
 $$
 
-Counts above $m_{\max}=\min(M,K,N-K)$ are masked with $-\infty$.
-Softmax over the remaining logits defines
+The legal maximum is
 
 $$
-P_\theta(m=j\mid o,\mathrm{continue})
-=\frac{\exp(\lambda^{\mathrm{count}}_j)}
-{\sum_{q=0}^{m_{\max}}\exp(\lambda^{\mathrm{count}}_q)},
-\qquad 0\leq j\leq m_{\max}.
+m_{\max}=\min(M,K,N-K).
 $$
 
-Here $o$ denotes the current observation, from which $g$ was computed.
-The sampled $m$ is the number of pairs: remove $m$ selected points and add
-$m$ unselected points. It chooses the edit size before its members.
-
-Suppose our example samples $m=1$, with an exchange cap that allows this.
-The policy has committed to one removal and one addition. It has not yet chosen
-which points participate.
-
-If $m=0$, action construction ends with a continuing no-op. In particular,
-$M=0$, $K=0$, or $K=N$ makes count zero the only continuing choice.
-The positive-count decoder below is entered only when $m>0$.
+Counts above $m_{\max}$ receive $-\infty$ before the categorical distribution
+is formed. The selected count means remove $m$ points selected at the start
+of the action and add $m$ points unselected at the start. A zero count
+produces a continuing no-op; it does not stop the episode. For $M=0$, $K=0$,
+or $K=N$, zero is the only continuing count.
 
 ## 7. Initialize the decoder's memory
 
-A learned count embedding represents the sampled exchange size:
+The decoder embeds the selected count and combines it with the global state:
 
 $$
-e_m=\operatorname{Embed}_m(m)\in\mathbb R^d.
-$$
-
-Combine it with the global representation to initialize memory:
-
-$$
+e_m=\operatorname{Embed}_m(m)\in\mathbb R^d,\qquad
 c_0=\operatorname{MLP}_c([g,e_m])\in\mathbb R^d,
-\qquad \operatorname{MLP}_c:\mathbb R^{2d}\to\mathbb R^d.
 $$
 
-The memory summarizes the configuration and the planned exchange size before
-any point has been selected. It is initialized afresh for every environment
-action. There is no decoder memory carried from the preceding action.
+where $\operatorname{MLP}_c:\mathbb R^{2d}\to\mathbb R^d$. The memory is fresh
+for every environment action, not carried across decisions. For $m>0$, the
+decoder completes all removals before starting additions.
 
-For $m=1$, the decoder must make two internal choices. It chooses a removal
-first, then an addition. For general $m$, it completes all $m$ removals before
-starting the $m$ additions.
+## 8. Decode removals and additions
 
-## 8. Construct the first removal query
-
-The first query combines the current memory with a learned removal-phase
-embedding $e_{\mathrm{remove}}\in\mathbb R^d$ and a scalar describing how many
-removal choices remain. Initially all $m$ remain, so the fraction is $m/m=1$:
+For $m>0$, internal choice $\ell\in\{1,\ldots,2m\}$ has a phase and a
+remaining-choice count:
 
 $$
-q_1=\operatorname{MLP}_q([c_0,e_{\mathrm{remove}},1])\in\mathbb R^d,
-\qquad \operatorname{MLP}_q:\mathbb R^{2d+1}\to\mathbb R^d.
-$$
-
-The query represents what the decoder is looking for at this choice. To compare
-it with the points, project the query and each point representation into a
-common space of width $d_k$:
-
-$$
-\chi_1=q_1W_Q,\qquad \kappa_i=H_{i,:}W_K,
-\qquad W_Q,W_K\in\mathbb R^{d\times d_k}.
-$$
-
-All neural feature vectors use a row-vector convention in these projections.
-The point keys $\kappa_i$ can be calculated once for the complete action.
-Assign point $i$ a pointer logit
-
-$$
-L_{1,i}=\frac{\langle\chi_1,\kappa_i\rangle}{\sqrt{d_k}}.
-$$
-
-This gives $N$ logits, one per original point. The next component restricts
-which of those points may be removed.
-
-## 9. Mask invalid points and select a removal
-
-Only currently selected points are eligible for the first removal. Mask the
-other logits and sample from the resulting categorical distribution:
-
-$$
-\widetilde L_{1,i}=\begin{cases}L_{1,i},&z_i=1,\\
--\infty,&z_i=0,\end{cases}
-\qquad
-p_{1,i}=\operatorname{softmax}_i(\widetilde L_1),
-\qquad j_1\sim\operatorname{Categorical}(p_1).
-$$
-
-In the running example, the selected set is $\{1,2\}$. To illustrate the
-sampling process, suppose the distribution assigns probabilities $0.3$ and
-$0.7$ to those points. Points 3 and 4 have probability zero. Suppose point 2
-is sampled, so $j_1=2$.
-
-These probabilities and choices are illustrative, not outputs of a trained
-model. We have recorded a planned removal, but the selection is still
-$(1,1,0,0)^\top$. The environment waits for the completed exchange.
-
-## 10. Update the memory after the choice
-
-A gated recurrent unit (GRU) updates the decoder memory using the chosen point's
-representation and the current phase:
-
-$$
-c_1=\operatorname{GRUCell}_\theta([H_{j_1,:},e_{\mathrm{remove}}],c_0)
-\in\mathbb R^d.
-$$
-
-The GRU input has width $2d$ and its hidden state has width $d$. Its gates learn
-how to combine the previous memory with information about the new choice.
-The resulting $c_1$ allows the next query to depend on the removal of point 2.
-
-```text
-Chosen point representation H[2] [d] --+
-                                      +--> GRU input [2d] --+
-Removal phase embedding [d] -----------+                    |
-                                                           v
-Previous memory c_0 [d] ----------------------------------> GRU --> c_1 [d]
-```
-
-The point representations $H$ stay fixed throughout this action. The memory
-changes with each choice, and the masks record which points remain eligible.
-For $m>1$, the next removal would exclude point 2 and use this updated memory.
-
-## 11. Choose additions and generalize the loop
-
-In our $m=1$ example, the removal phase is complete. The next query uses $c_1$
-and the addition-phase embedding $e_{\mathrm{add}}$:
-
-$$
-q_2=\operatorname{MLP}_q([c_1,e_{\mathrm{add}},1]).
-$$
-
-Point scoring uses the same projected keys. The eligible additions are the
-points that were unselected at the start of the action: $\{3,4\}$. Removing
-point 2 did not make it an eligible addition.
-
-For illustration, suppose addition probabilities are $0.2$ for point 3 and
-$0.8$ for point 4, and point 4 is sampled. The GRU updates with the addition
-embedding and $H_{4,:}$. Both choices for this action are now complete.
-
-For a general positive count $m$, let $\ell\in\{1,\ldots,2m\}$ index internal
-choices. Its phase $\phi_\ell$ and the number $n_\ell$ of choices still needed
-in that phase are
-
-$$
-\phi_\ell=\begin{cases}
+\phi_\ell=
+\begin{cases}
 \mathrm{remove},&1\leq\ell\leq m,\\
 \mathrm{add},&m<\ell\leq2m,
 \end{cases}
 \qquad
-n_\ell=\begin{cases}
+n_\ell=
+\begin{cases}
 m-\ell+1,&1\leq\ell\leq m,\\
 2m-\ell+1,&m<\ell\leq2m.
 \end{cases}
 $$
 
-Each iteration follows the same equations:
+At the first step, $c_{\ell-1}=c_0$, $\phi_\ell=\mathrm{remove}$, and
+$n_\ell/m=1$. The query network maps $\mathbb R^{2d+1}$ to $\mathbb R^d$.
+With $\kappa_i=H_{i,:}W_K$ and
+$W_Q,W_K\in\mathbb R^{d\times d_k}$, each step computes
 
 $$
 q_\ell=\operatorname{MLP}_q([c_{\ell-1},e_{\phi_\ell},n_\ell/m]),
@@ -438,135 +184,126 @@ L_{\ell,i}=\frac{\langle q_\ell W_Q,\kappa_i\rangle}{\sqrt{d_k}},
 $$
 
 $$
-c_\ell=\operatorname{GRUCell}_\theta([H_{j_\ell,:},e_{\phi_\ell}],c_{\ell-1}).
+c_\ell=\operatorname{GRUCell}_\theta(
+[H_{j_\ell,:},e_{\phi_\ell}],c_{\ell-1}).
 $$
 
-Before sampling $j_\ell$, exclude points already chosen in the same phase.
-Writing $z$ for the original selection throughout this loop, the legal sets are
+The legal points are
 
 $$
-\mathcal I_\ell=\begin{cases}
+\mathcal I_\ell=
+\begin{cases}
 \{i:z_i=1\}\setminus\{j_1,\ldots,j_{\ell-1}\},&1\leq\ell\leq m,\\
 \{i:z_i=0\}\setminus\{j_{m+1},\ldots,j_{\ell-1}\},&m<\ell\leq2m.
 \end{cases}
 $$
 
-An empty history excludes nothing. Define $\mu_{\ell,i}=0$ when
-$i\in\mathcal I_\ell$ and $-\infty$ otherwise. The general point distribution is
+Set the mask to $\mu_{\ell,i}=0$ for $i\in\mathcal I_\ell$ and
+$-\infty$ otherwise. The point distribution is
 
 $$
 P_\theta(j_\ell=i\mid o,\mathrm{continue},m,j_{<\ell})
 =\operatorname{softmax}_i(L_\ell+\mu_\ell).
 $$
 
-For example, if $m=2$, the remaining-choice fractions are $1,1/2,1,1/2$.
-Two distinct removals precede two distinct additions. The count cap ensures
-that each phase has enough eligible points to finish.
+The same GRU memory carries from removals into additions, while $H$ stays
+fixed. Its input has width $2d$ and hidden state width $d$. The count cap
+guarantees enough eligible points for both phases. A zero count skips this
+loop.
 
-## 12. Submit one complete exchange
+## 9. Submit one complete exchange
 
-The ordered choices determine removal set $\mathcal R=\{j_1,\ldots,j_m\}$
-and addition set $\mathcal C=\{j_{m+1},\ldots,j_{2m}\}$. Convert them to the
-[signed exchange](environment.md#one-continuing-action) and submit it with
-continue. The environment then applies every edit simultaneously.
-
-Our example gives
-
-```text
-Ordered choices: remove 2, add 4
-Complete exchange: [0,-1,0,+1]
-
-Environment selection before: [1,1,0,0]
-Environment selection after:  [1,0,0,1]
-```
-
-The [environment reward example](environment.md#utility-and-reward) evaluates
-this exact transition. No reward was produced between the removal choice and
-the addition choice. At the next active observation, the encoder runs again
-and any new decoder starts with fresh memory.
-
-## 13. Assign a probability to the complete choice sequence
-
-Training needs the probability of the choices that produced an environment
-action. Call the ordered trace $\xi$. For our example,
-$\xi=(\mathrm{continue},1,2,4)$ records the branch, pair count, removal, and addition.
-
-Its probability is a product of conditional probabilities:
+The ordered choices define
+$\mathcal R=\{j_1,\ldots,j_m\}$ and
+$\mathcal C=\{j_{m+1},\ldots,j_{2m}\}$. The policy converts them to the
+[signed exchange](environment.md#one-continuing-action), which the caller
+submits with continue. The environment applies all edits simultaneously:
 
 $$
-\begin{aligned}
-\pi_\theta(\xi\mid o)
-={}&P_\theta(\mathrm{continue}\mid o)\,
-P_\theta(m=1\mid o,\mathrm{continue})\\
-&\times P_\theta(j_1=2\mid o,\mathrm{continue},1)\\
-&\times P_\theta(j_2=4\mid o,\mathrm{continue},1,j_1=2).
-\end{aligned}
+a_i=
+\begin{cases}
+-1,&i\in\mathcal R,\\
++1,&i\in\mathcal C,\\
+0,&\text{otherwise}.
+\end{cases}
+\qquad
+z_{\mathrm{next}}=z+a.
 $$
 
-The branch probability is learned because continue and stop remain available.
-If the illustrative branch, count, and point probabilities are $0.9$, $0.6$,
-$0.7$, and $0.8$, the trace probability is
-$0.9\times0.6\times0.7\times0.8=0.3024$. These values specify no learned
-parameters.
+Stop instead submits a zero exchange and ends the episode. A continuing
+no-op also has a zero exchange, but consumes a decision. The next observation
+runs the encoder again and starts a new decoder memory. The environment emits
+one reward for the complete action, not for its internal point choices. See the
+[environment reward definition](environment.md#utility-and-reward) for the
+transition reward.
 
-For a general continuing trace with $m>0$, the chain rule gives
+## 10. Assign a probability to the complete choice sequence
+
+An ordered trace has the branch, count, and point choices:
+
+$$
+\xi=(\mathrm{branch},m,j_1,\ldots,j_{2m})
+$$
+
+for $m>0$. Its probability is
 
 $$
 \pi_\theta(\xi\mid o)=P_\theta(\mathrm{continue}\mid o)
 P_\theta(m\mid o,\mathrm{continue})
-\prod_{\ell=1}^{2m}P_\theta(j_\ell\mid o,\mathrm{continue},m,j_{<\ell}).
+\prod_{\ell=1}^{2m}
+P_\theta(j_\ell\mid o,\mathrm{continue},m,j_{<\ell}).
 $$
 
-Taking logarithms turns the product into a sum:
+The policy stores the log probability:
 
 $$
 \begin{aligned}
 \log\pi_\theta(\xi\mid o)
 ={}&\log P_\theta(\mathrm{continue}\mid o)
 +\log P_\theta(m\mid o,\mathrm{continue})\\
-&+\sum_{\ell=1}^{2m}\log P_\theta(j_\ell\mid o,\mathrm{continue},m,j_{<\ell}).
+&+\sum_{\ell=1}^{2m}
+\log P_\theta(j_\ell\mid o,\mathrm{continue},m,j_{<\ell}).
 \end{aligned}
 $$
 
-A stop trace has only $\log P_\theta(\mathrm{stop}\mid o)$.
-A continuing zero-count trace has only the continue and count-zero terms.
-Unused branches and point choices contribute no probability terms.
+A stop trace contributes only $\log P_\theta(\mathrm{stop}\mid o)$. A
+continuing zero-count trace contributes the continue and count-zero terms.
+Policy evaluation recomputes these terms from the original observation and
+supplied ordered trace without sampling.
 
-Different choice orders can produce the same exchange sets. PPO uses the
-probability of the sampled ordered trace. Its update must reevaluate that
-same order with the same observation and eligibility rules. An unordered
-exchange probability would require summing over all traces producing that
-exchange; the baseline does not perform that sum.
+Different point orders can produce the same exchange sets. The current
+training interface scores the sampled ordered trace. PPO must replay that
+order with the same observation and masks. An unordered exchange probability
+would require summing over every trace that yields the exchange; the baseline
+does not do that.
 
-## 14. Connect the trace to PPO and the value estimate
+## 11. Connect the trace to PPO and the value estimate
 
-One environment action has one reward, even when its trace contains several
-internal choices. Restore the environment time index $t$: the observation is
-$o_t$, the trace is $\xi_t$, and the complete action receives $R_t$.
-
-The value head uses the same global representation as the action heads:
+One environment action receives one reward, even when its trace has several
+internal choices. At environment time $t$, the observation is $o_t$, the
+trace is $\xi_t$, and the completed action receives $R_t$. The value head uses
+the same global representation:
 
 $$
 V_\theta(o_t)=g_tw_V+\beta_V\in\mathbb R,
 \qquad w_V\in\mathbb R^d.
 $$
 
-It estimates expected remaining return under the policy. The chosen baseline
-uses $\gamma=1$, giving the target quantity
+It estimates expected future return. With $\gamma=1$,
 
 $$
 V^\pi(o_t)=\mathbb E_\pi\left[
 \sum_{j=t}^{t_{\mathrm{end}}-1}R_j\,\middle|\,o_t\right]
-=\mathbb E_\pi\left[F(z_{t_{\mathrm{end}}})-F(z_t)\,\middle|\,o_t\right].
+=\mathbb E_\pi\left[
+F(z_{t_{\mathrm{end}}})-F(z_t)\,\middle|\,o_t\right].
 $$
 
 The equality follows from the [telescoping return](environment.md#return-over-an-episode).
-The value estimate concerns future utility change. It is not a certificate of
-the best achievable solution.
+The value is an estimate of future utility change, not a certificate of the
+best solution.
 
-For the PPO update, retain the sampled trace and its log probability under the
-policy that collected it, with parameters $\theta_{\mathrm{old}}$.
-Reevaluate the trace with parameters $\theta$ to form the likelihood ratio
+For PPO, retain the sampled trace and old log probability, then reevaluate the
+same trace under the current parameters:
 
 $$
 \rho_t(\theta)=\frac{\pi_\theta(\xi_t\mid o_t)}
@@ -575,60 +312,54 @@ $$
 -\log\pi_{\theta_{\mathrm{old}}}(\xi_t\mid o_t)\right).
 $$
 
-This compares how likely the same sequence is under the two policies.
-Its advantage estimate belongs to the complete environment action. The full
-PPO loss, advantage estimator, entropy treatment, and optimizer settings remain
-unspecified; this design defines their trace-likelihood and value interfaces.
+The advantage belongs to the complete environment action. The full PPO loss,
+advantage estimator, entropy term, and optimizer settings are unspecified;
+this design fixes the trace-likelihood and value interfaces.
 
 ## Design rationale and limitations
 
-The encoder lets each point representation incorporate the configuration.
-The recurrent decoder lets later choices depend on earlier choices in the
-same action. Together they construct an exchange without explicitly scoring
-every unordered exchange set, whose count through the cap is
+The encoder supplies configuration-aware point representations, while the
+GRU decoder makes later choices depend on earlier choices. The policy avoids
+enumerating every unordered exchange set, whose count is
 
 $$
 \sum_{m=0}^{m_{\max}}\binom Km\binom{N-K}m.
 $$
 
-The policy makes $2m$ point choices for a positive count, and each choice scores
-$N$ points. Dense encoder attention still forms $N^2$ pairwise interactions
-per head and layer. The environment also stores $N^2$ contributions.
-Avoiding exchange enumeration does not establish a wall-clock speedup.
+For a positive count it makes $2m$ point choices, each scoring $N$ points.
+Dense encoder attention still forms $N^2$ interactions per head and layer, and
+the environment stores $N^2$ contributions. Avoiding exchange enumeration does
+not establish a wall-clock speedup.
 
-The masks enforce valid membership and distinct choices, with equal removal
-and addition counts. They cannot guarantee utility improvement or demand
-satisfaction. The GRU
-compresses the choice history into a fixed-width memory, which may limit its
-usefulness for large exchanges. A decoder with explicit history would be a
-separate architectural variant.
-
-Final solution quality and generalization require experiments under a stated
-inference budget. This proposed architecture has no measured performance claim.
+The masks enforce membership and distinct choices; the decoder removes and adds
+exactly $m$ points. These constraints do not guarantee utility improvement or
+demand satisfaction. The fixed-width GRU memory may limit the decoder for large
+exchanges. Final solution quality and generalization require experiments under
+a stated inference budget; the architecture has no measured performance claim.
 
 ## Notation reference
 
 | Symbol | Meaning | Dimension or range |
 | --- | --- | --- |
-| $o$ | Active observation of one instance | Fixed instance and current episode quantities |
+| $o$ | Active observation | Fixed instance and current episode quantities |
 | $N,D,K,M,T$ | Problem and episode parameters | Defined in [problem](problem.md) and [environment](environment.md) |
-| $h$ | Remaining decisions | Scalar integer in $[0,T]$ |
+| $h$ | Remaining decisions | Integer in $[0,T]$ |
 | $u$ | Receiver demand caps | $\mathbb R_{\geq0}^N$ |
 | $v_i$ | Features of point $i$ | $\mathbb R^{D+4}$ |
 | $E,H$ | Embedded and contextualized points | $\mathbb R^{N\times d}$ |
-| $d,L_{\mathrm{enc}},h_{\mathrm{enc}}$ | Model width, encoder depth, and head count | Symbolic positive integers |
-| $d_a,d_v$ | Query/key and value widths of an illustrative attention head | Symbolic positive integers |
-| $\bar h,g$ | Mean representation and global representation | $\mathbb R^d$ |
+| $d,L_{\mathrm{enc}},h_{\mathrm{enc}}$ | Width, encoder depth, and head count | Symbolic positive integers |
+| $d_a,d_v$ | Query/key and value widths of one attention head | Symbolic positive integers |
+| $\bar h,g$ | Mean and global representations | $\mathbb R^d$ |
 | $m$ | Sampled pair count | $0,\ldots,m_{\max}$ |
-| $\ell,n_\ell$ | Internal choice index and remaining choices in its phase | $1\leq\ell\leq2m$, $1\leq n_\ell\leq m$ |
-| $e_m,e_{\phi_\ell}$ | Learned count and phase embeddings | $\mathbb R^d$ |
+| $\ell,n_\ell$ | Internal choice and remaining choices in its phase | $1\leq\ell\leq2m$, $1\leq n_\ell\leq m$ |
+| $e_m,e_{\phi_\ell}$ | Count and phase embeddings | $\mathbb R^d$ |
 | $c_\ell,q_\ell$ | Decoder memory and query | $\mathbb R^d$ |
 | $\kappa_i,\chi_\ell$ | Projected point key and query | $\mathbb R^{d_k}$ |
 | $L_\ell,\mu_\ell$ | Point logits and eligibility mask | $N$ entries |
 | $j_\ell$ | Chosen point | Integer in $\{1,\ldots,N\}$ |
-| $\xi,\pi_\theta(\xi\mid o)$ | Ordered trace and its probability | Branch-dependent sequence and scalar |
+| $\xi,\pi_\theta(\xi\mid o)$ | Ordered trace and probability | Branch-dependent sequence and scalar |
 | $t$ | Environment decision index | Distinct from internal index $\ell$ |
-| $V_\theta,\rho_t$ | Learned value estimate and PPO likelihood ratio | Scalars |
+| $V_\theta,\rho_t$ | Value estimate and PPO likelihood ratio | Scalars |
 
 ## Architectural precedents
 
@@ -636,9 +367,9 @@ inference budget. This proposed architecture has no measured performance claim.
 selecting input positions with an attention pointer.
 [Attention, Learn to Solve Routing Problems!](https://arxiv.org/abs/1803.08475)
 provides related attention-based construction of combinatorial solutions.
-These are architectural precedents for the proposal, without establishing its
-performance on emitter placement.
+These papers motivate the architecture but do not establish performance on
+emitter placement.
 
 [Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347)
 provides the likelihood-ratio training framework. The trace construction and
-environment reward above specify how this proposed policy connects to it.
+environment reward above specify the proposed training connection.

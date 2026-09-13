@@ -1,32 +1,53 @@
 # Fixed-budget emitter placement
 
-Select exactly $K$ points as emitters to maximize capped weighted received
-signal. Every point is a receiver, and selected points also contribute signal
-according to their distance from each receiver.
+Select exactly $K$ emitters to maximize weighted received signal, capped at
+each receiver's demand. Every point is a receiver and a possible emitter.
+Contributions decay exponentially with Euclidean distance.
 
-The repository implements a PyTorch environment for emitter-exchange episodes,
-a transformer encoder, stop/count/value heads, and a conditional GRU pointer
-decoder. Complete policy assembly, environment-action construction, and PPO
-training remain unimplemented.
+This is an ongoing research project about learned local search for this
+fixed-budget placement problem. The project investigates how the action design
+and the amount of search used at inference affect the solutions we find.
 
-The repository is organized by responsibility: `envs/` contains implemented
-environment code, `parameters/` contains YAML configuration, and `models/`
-contains neural model implementations.
+## Research questions
+
+1. **Does learning variable-size exchanges improve local search compared with
+   learning one exchange at a time?**
+
+   The structured policy chooses how many emitters to exchange, then chooses the
+   points to remove and add. A simpler learned policy makes one
+   removal/addition pair per decision. We will compare solution quality and
+   training efficiency, and examine when larger moves help.
+
+2. **Can search at inference time improve the solutions found by a trained
+   policy?**
+
+   The initial inference experiment will sample multiple policy-guided
+   trajectories and keep the best final selection. Each trajectory repeatedly
+   generates one complete exchange, applies it, and observes the next state. We
+   will compare this with a single trajectory, including deterministic policy
+   decoding.
+
+Evaluation will compare solution quality with computational cost. Planned
+baselines include objective-based greedy construction and simple local search.
+We will use unseen instances and test larger or shifted instances for
+generalization.
+Decision counts alone will not define compute, since a larger exchange
+requires more point selections.
+
+## Status
+
+The batched PyTorch environment and transformer/GRU policy are implemented.
+PPO training and the experiments above are unfinished.
+Code lives in `envs/` and `models/`; YAML configuration lives in `parameters/`.
 
 ## Research documentation
 
-Read these documents in order for a guided explanation of one instance:
-
-1. [Problem](docs/research/problem.md): points, emitter selection, received signal,
-   capped utility, and unmet demand.
-2. [Environment](docs/research/environment.md): initialization, exchanges,
-   rewards, and the episode's final outcome.
-3. [Model](docs/research/model.md): point features, attention, implemented model
-   components, proposed action composition, and PPO boundary.
+1. [Problem](docs/research/problem.md): formulation, signal, capped utility, and unmet demand.
+2. [Environment](docs/research/environment.md): initialization, exchanges, rewards, and episode outcome.
+3. [Model](docs/research/model.md): features, attention, policy decisions, and proposed PPO training.
 
 ## Code documentation
 
-The [environment reference](docs/code/environment.md) covers the implemented
-API, tensor shapes, configuration, reset and step behavior, and executable usage.
-The [encoder reference](docs/code/transformer_encoder.md) follows the observation
-features through attention and pooling, with shape annotations and executable usage.
+- [Environment](docs/code/environment.md): API, tensor shapes, configuration, reset/step behavior, and usage.
+- [Encoder](docs/code/transformer_encoder.md): observation features, attention, pooling, shapes, and usage.
+- [Policy](docs/code/policy.md): action generation, ordered trace replay, and tensor contracts.
