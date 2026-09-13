@@ -53,9 +53,9 @@ class BatchedEmitterEnv:
     ) -> None:
         """Clone points, weights, and demand caps onto the configured device; call ``reset()`` before stepping."""
         self.config = config
-        self._points = points.detach().to(config.device).clone()
-        self._weights = weights.detach().to(config.device).clone()
-        self._demands = demands.detach().to(config.device).clone()
+        self._points = points.to(config.device).clone()
+        self._weights = weights.to(config.device).clone()
+        self._demands = demands.to(config.device).clone()
         self._device = self._points.device
         self._contributions = self._build_contributions()
         self._generator = torch.Generator(device=self._device)

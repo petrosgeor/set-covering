@@ -33,7 +33,6 @@ class TransformerEncoder(nn.Module):
         """Build the encoder from caller-owned architecture settings."""
         super().__init__()
         self.config = config
-        self.coordinate_dim = coordinate_dim
 
         self.input_projection = nn.Sequential(
             nn.Linear(coordinate_dim + 4, config.model_dim), nn.GELU(), nn.Linear(config.model_dim, config.model_dim)
