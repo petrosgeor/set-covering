@@ -58,20 +58,23 @@ class EmitterPolicy(nn.Module):
                 continuing_counts = count_logits[continuing_rows].argmax(dim=-1)
             else:
                 continuing_counts = continuing_count_distribution.sample()
-            counts.index_copy_(0, continuing_rows, continuing_counts)
+            counts[continuing_rows] = continuing_counts
 
         removals, additions, decoder_log_prob = self.decoder(
             point_embeddings, global_embedding, selected=selected, counts=counts, greedy=greedy
         )
 
-        valid_prefix = torch.arange(self.decoder.max_exchanges, device=counts.device).unsqueeze(0) < counts.unsqueeze(1)
+        choice_positions: Int[Tensor, "M"] = torch.arange(self.decoder.max_exchanges, device=counts.device)
+        # Only the first counts[b] choices in each row belong to the action.
+        valid_choices: Bool[Tensor, "B M"] = choice_positions.unsqueeze(0) < counts.unsqueeze(-1)
+        # Scatter needs valid indices; padded slots point to 0 but contribute zero.
         removal_addresses = removals.clamp_min(0)
         addition_addresses = additions.clamp_min(0)
-        exchanges: Int[Tensor, "B N"] = torch.zeros(
-            batch_size, selected.shape[1], dtype=torch.int64, device=selected.device
-        )
-        exchanges.scatter_add_(1, removal_addresses, -valid_prefix.to(dtype=torch.int64))
-        exchanges.scatter_add_(1, addition_addresses, valid_prefix.to(dtype=torch.int64))
+        exchanges: Int[Tensor, "B N"] = torch.zeros_like(selected, dtype=torch.int64)
+        choice_contributions: Int[Tensor, "B M"] = valid_choices.to(dtype=torch.int64)
+        # Valid removals contribute -1; valid additions contribute +1; padding contributes 0.
+        exchanges.scatter_add_(1, removal_addresses, -choice_contributions)
+        exchanges.scatter_add_(1, addition_addresses, choice_contributions)
 
         head_log_prob = self._head_log_prob(stop_logits, count_logits, stop, counts)
         log_prob = head_log_prob + decoder_log_prob
@@ -116,7 +119,8 @@ class EmitterPolicy(nn.Module):
         count_log_prob = torch.zeros_like(branch_log_prob)
         continuing_rows = (~stop).nonzero(as_tuple=True)[0]
         if continuing_rows.numel():
-            count_log_prob.index_copy_(
-                0, continuing_rows, Categorical(logits=count_logits[continuing_rows]).log_prob(counts[continuing_rows])
+            continuing_distribution = Categorical(logits=count_logits[continuing_rows])
+            count_log_prob[continuing_rows] = continuing_distribution.log_prob(
+                counts[continuing_rows]
             )
         return branch_log_prob + count_log_prob
