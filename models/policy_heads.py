@@ -1,7 +1,7 @@
 """Stop, exchange-count, and value heads for emitter observations."""
 
 import torch
-from jaxtyping import Bool, Float
+from jaxtyping import Bool, Float, Int
 from torch import Tensor, nn
 
 
@@ -31,9 +31,13 @@ class PolicyHeads(nn.Module):
         """
         stop_logits = self.stop_head(g)
 
-        num_selected = selected.sum(dim=-1)
-        count_limit = torch.minimum(num_selected, selected.shape[1] - num_selected).clamp_max(self.max_exchanges)
-        counts = torch.arange(self.max_exchanges + 1, device=g.device)
+        num_selected: Int[Tensor, "B"] = selected.sum(dim=-1)
+        num_unselected: Int[Tensor, "B"] = selected.shape[1] - num_selected
+        # Each pair removes one selected point and adds one unselected point: m <= min(K, N-K).
+        count_limit: Int[Tensor, "B"] = torch.minimum(num_selected, num_unselected)
+        # The head only offers counts 0 through M, so no additional clamp to M is needed.
+        counts: Int[Tensor, "M_plus_1"] = torch.arange(self.max_exchanges + 1, device=g.device)
+        # Broadcast [1, M+1] against [B, 1] to mask unavailable counts in each row.
         count_logits = self.count_head(g).masked_fill(counts.unsqueeze(0) > count_limit.unsqueeze(-1), -torch.inf)
         value = self.value_head(g).squeeze(-1)
         return stop_logits, count_logits, value
